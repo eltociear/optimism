@@ -1,5 +1,62 @@
 # @eth-optimism/contracts-bedrock
 
+## 0.16.0
+
+### Minor Changes
+
+- [#6206](https://github.com/ethereum-optimism/optimism/pull/6206) [`72d184854`](https://github.com/ethereum-optimism/optimism/commit/72d184854ebad8b2025641f126ed76573b1f0ac3) Thanks [@tynes](https://github.com/tynes)! - Migrate contracts periphery into bedrock
+
+### Patch Changes
+
+- [#6164](https://github.com/ethereum-optimism/optimism/pull/6164) [`c11039060`](https://github.com/ethereum-optimism/optimism/commit/c11039060bc037a88916c2cba602687b6d69ad1a) Thanks [@pengin7384](https://github.com/pengin7384)! - fix typo
+
+- [#6198](https://github.com/ethereum-optimism/optimism/pull/6198) [`77da6edc6`](https://github.com/ethereum-optimism/optimism/commit/77da6edc643e0b5e39f7b6bb41c3c7ead418a876) Thanks [@tremarkley](https://github.com/tremarkley)! - Delete dead typescript https://github.com/ethereum-optimism/optimism/pull/6148.
+
+## 0.15.0
+
+### Minor Changes
+
+- af292562f: Fix issue with deposits running out of gas
+
+### Patch Changes
+
+- Updated dependencies [8d7dcc70c]
+- Updated dependencies [d6388be4a]
+  - @eth-optimism/core-utils@0.12.1
+
+## 0.14.0
+
+### Minor Changes
+
+- 197884eae: Bump XDM semver after #5444
+- 6eb05430d: Increase precision in `SafeCall.hasMinGas`
+- 5063a69fb: Update sdk contract addresses for bedrock
+
+### Patch Changes
+
+- f1e867177: contracts-bedrock was exporting hardhat when it didn't need to be
+
+## 0.13.2
+
+### Patch Changes
+
+- b16067a9f: Reduce the time that the system dictator deploy scripts wait before checking the chain state.
+- 9a02079eb: Makes the Proxy contract inheritable by making functions (public virtual).
+- 98fbe9d22: Added a contsructor to the System Dictator
+
+## 0.13.1
+
+### Patch Changes
+
+- 22c3885f5: Optionally print cast commands during migration
+- f52c07529: Print tenderly simulation links during deployment
+
+## 0.13.0
+
+### Minor Changes
+
+- cb19e2f9c: Moves `FINALIZATION_PERIOD_SECONDS` from the `OptimismPortal` to the `L2OutputOracle` & ensures the `CHALLENGER` key cannot delete finalized outputs.
+
 ## 0.12.1
 
 ### Patch Changes

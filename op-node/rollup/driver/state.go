@@ -47,6 +47,14 @@ type Driver struct {
 	// It tells the caller that the sequencer stopped by returning the latest sequenced L2 block hash.
 	stopSequencer chan chan hashAndError
 
+	// Upon receiving a channel in this channel, the current sequencer status is queried.
+	// It tells the caller the status by outputting a boolean to the provided channel:
+	// true when the sequencer is active, false when it is not.
+	sequencerActive chan chan bool
+
+	// sequencerNotifs is notified when the sequencer is started or stopped
+	sequencerNotifs SequencerStateListener
+
 	// Rollup config: rollup chain configuration
 	config *rollup.Config
 
@@ -63,7 +71,11 @@ type Driver struct {
 	l1SafeSig      chan eth.L1BlockRef
 	l1FinalizedSig chan eth.L1BlockRef
 
+	// Interface to signal the L2 block range to sync.
+	altSync AltSync
+
 	// L2 Signals:
+
 	unsafeL2Payloads chan *eth.ExecutionPayload
 
 	l1        L1Chain
@@ -83,6 +95,21 @@ type Driver struct {
 // The loop will have been started iff err is not nil.
 func (s *Driver) Start() error {
 	s.derivation.Reset()
+
+	log.Info("Starting driver", "sequencerEnabled", s.driverConfig.SequencerEnabled, "sequencerStopped", s.driverConfig.SequencerStopped)
+	if s.driverConfig.SequencerEnabled {
+		// Notify the initial sequencer state
+		// This ensures persistence can write the state correctly and that the state file exists
+		var err error
+		if s.driverConfig.SequencerStopped {
+			err = s.sequencerNotifs.SequencerStopped()
+		} else {
+			err = s.sequencerNotifs.SequencerStarted()
+		}
+		if err != nil {
+			return fmt.Errorf("persist initial sequencer state: %w", err)
+		}
+	}
 
 	s.wg.Add(1)
 	go s.eventLoop()
@@ -195,16 +222,46 @@ func (s *Driver) eventLoop() {
 		sequencerTimer.Reset(delay)
 	}
 
+	// Create a ticker to check if there is a gap in the engine queue. Whenever
+	// there is, we send requests to sync source to retrieve the missing payloads.
+	syncCheckInterval := time.Duration(s.config.BlockTime) * time.Second * 2
+	altSyncTicker := time.NewTicker(syncCheckInterval)
+	defer altSyncTicker.Stop()
+	lastUnsafeL2 := s.derivation.UnsafeL2Head()
+
 	for {
 		// If we are sequencing, and the L1 state is ready, update the trigger for the next sequencer action.
 		// This may adjust at any time based on fork-choice changes or previous errors.
-		if s.driverConfig.SequencerEnabled && !s.driverConfig.SequencerStopped && s.l1State.L1Head() != (eth.L1BlockRef{}) {
-			// update sequencer time if the head changed
-			if s.sequencer.BuildingOnto().ID() != s.derivation.UnsafeL2Head().ID() {
+		// And avoid sequencing if the derivation pipeline indicates the engine is not ready.
+		if s.driverConfig.SequencerEnabled && !s.driverConfig.SequencerStopped &&
+			s.l1State.L1Head() != (eth.L1BlockRef{}) && s.derivation.EngineReady() {
+			if s.driverConfig.SequencerMaxSafeLag > 0 && s.derivation.SafeL2Head().Number+s.driverConfig.SequencerMaxSafeLag <= s.derivation.UnsafeL2Head().Number {
+				// If the safe head has fallen behind by a significant number of blocks, delay creating new blocks
+				// until the safe lag is below SequencerMaxSafeLag.
+				if sequencerCh != nil {
+					s.log.Warn(
+						"Delay creating new block since safe lag exceeds limit",
+						"safe_l2", s.derivation.SafeL2Head(),
+						"unsafe_l2", s.derivation.UnsafeL2Head(),
+					)
+					sequencerCh = nil
+				}
+			} else if s.sequencer.BuildingOnto().ID() != s.derivation.UnsafeL2Head().ID() {
+				// If we are sequencing, and the L1 state is ready, update the trigger for the next sequencer action.
+				// This may adjust at any time based on fork-choice changes or previous errors.
+				//
+				// update sequencer time if the head changed
 				planSequencerAction()
 			}
 		} else {
 			sequencerCh = nil
+		}
+
+		// If the engine is not ready, or if the L2 head is actively changing, then reset the alt-sync:
+		// there is no need to request L2 blocks when we are syncing already.
+		if head := s.derivation.UnsafeL2Head(); head != lastUnsafeL2 || !s.derivation.EngineReady() {
+			lastUnsafeL2 = head
+			altSyncTicker.Reset(syncCheckInterval)
 		}
 
 		select {
@@ -223,6 +280,14 @@ func (s *Driver) eventLoop() {
 				}
 			}
 			planSequencerAction() // schedule the next sequencer action to keep the sequencing looping
+		case <-altSyncTicker.C:
+			// Check if there is a gap in the current unsafe payload queue.
+			ctx, cancel := context.WithTimeout(ctx, time.Second*2)
+			err := s.checkForGapInUnsafeQueue(ctx)
+			cancel()
+			if err != nil {
+				s.log.Warn("failed to check for unsafe L2 blocks to sync", "err", err)
+			}
 		case payload := <-s.unsafeL2Payloads:
 			s.snapshot("New unsafe payload")
 			s.log.Info("Optimistically queueing unsafe L2 execution payload", "id", payload.ID())
@@ -249,7 +314,12 @@ func (s *Driver) eventLoop() {
 			err := s.derivation.Step(context.Background())
 			stepAttempts += 1 // count as attempt by default. We reset to 0 if we are making healthy progress.
 			if err == io.EOF {
-				s.log.Debug("Derivation process went idle", "progress", s.derivation.Origin())
+				s.log.Debug("Derivation process went idle", "progress", s.derivation.Origin(), "err", err)
+				stepAttempts = 0
+				s.metrics.SetDerivationIdle(true)
+				continue
+			} else if err != nil && errors.Is(err, derive.EngineP2PSyncing) {
+				s.log.Debug("Derivation process went idle because the engine is syncing", "progress", s.derivation.Origin(), "sync_target", s.derivation.EngineSyncTarget(), "err", err)
 				stepAttempts = 0
 				s.metrics.SetDerivationIdle(true)
 				continue
@@ -292,6 +362,10 @@ func (s *Driver) eventLoop() {
 			} else if !bytes.Equal(unsafeHead[:], resp.hash[:]) {
 				resp.err <- fmt.Errorf("block hash does not match: head %s, received %s", unsafeHead.String(), resp.hash.String())
 			} else {
+				if err := s.sequencerNotifs.SequencerStarted(); err != nil {
+					resp.err <- fmt.Errorf("sequencer start notification: %w", err)
+					continue
+				}
 				s.log.Info("Sequencer has been started")
 				s.driverConfig.SequencerStopped = false
 				close(resp.err)
@@ -301,10 +375,16 @@ func (s *Driver) eventLoop() {
 			if s.driverConfig.SequencerStopped {
 				respCh <- hashAndError{err: errors.New("sequencer not running")}
 			} else {
+				if err := s.sequencerNotifs.SequencerStopped(); err != nil {
+					respCh <- hashAndError{err: fmt.Errorf("sequencer start notification: %w", err)}
+					continue
+				}
 				s.log.Warn("Sequencer has been stopped")
 				s.driverConfig.SequencerStopped = true
 				respCh <- hashAndError{hash: s.derivation.UnsafeL2Head().Hash}
 			}
+		case respCh := <-s.sequencerActive:
+			respCh <- !s.driverConfig.SequencerStopped
 		case <-s.done:
 			return
 		}
@@ -368,6 +448,24 @@ func (s *Driver) StopSequencer(ctx context.Context) (common.Hash, error) {
 	}
 }
 
+func (s *Driver) SequencerActive(ctx context.Context) (bool, error) {
+	if !s.driverConfig.SequencerEnabled {
+		return false, nil
+	}
+	respCh := make(chan bool, 1)
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case s.sequencerActive <- respCh:
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case active := <-respCh:
+			return active, nil
+		}
+	}
+}
+
 // syncStatus returns the current sync status, and should only be called synchronously with
 // the driver event loop to avoid retrieval of an inconsistent status.
 func (s *Driver) syncStatus() *eth.SyncStatus {
@@ -380,6 +478,8 @@ func (s *Driver) syncStatus() *eth.SyncStatus {
 		UnsafeL2:           s.derivation.UnsafeL2Head(),
 		SafeL2:             s.derivation.SafeL2Head(),
 		FinalizedL2:        s.derivation.Finalized(),
+		UnsafeL2SyncTarget: s.derivation.UnsafeL2SyncTarget(),
+		EngineSyncTarget:   s.derivation.EngineSyncTarget(),
 	}
 }
 
@@ -441,4 +541,21 @@ type hashAndError struct {
 type hashAndErrorChannel struct {
 	hash common.Hash
 	err  chan error
+}
+
+// checkForGapInUnsafeQueue checks if there is a gap in the unsafe queue and attempts to retrieve the missing payloads from an alt-sync method.
+// WARNING: This is only an outgoing signal, the blocks are not guaranteed to be retrieved.
+// Results are received through OnUnsafeL2Payload.
+func (s *Driver) checkForGapInUnsafeQueue(ctx context.Context) error {
+	start := s.derivation.UnsafeL2Head()
+	end := s.derivation.UnsafeL2SyncTarget()
+	// Check if we have missing blocks between the start and end. Request them if we do.
+	if end == (eth.L2BlockRef{}) {
+		s.log.Debug("requesting sync with open-end range", "start", start)
+		return s.altSync.RequestL2Range(ctx, start, eth.L2BlockRef{})
+	} else if end.Number > start.Number+1 {
+		s.log.Debug("requesting missing unsafe L2 block range", "start", start, "end", end, "size", end.Number-start.Number)
+		return s.altSync.RequestL2Range(ctx, start, end)
+	}
+	return nil
 }

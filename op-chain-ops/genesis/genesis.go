@@ -15,7 +15,11 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 )
 
-const defaultL2GasLimit = 15_000_000
+// defaultGasLimit represents the default gas limit for a genesis block.
+const defaultGasLimit = 30_000_000
+
+// BedrockTransitionBlockExtraData represents the default extra data for the bedrock transition block.
+var BedrockTransitionBlockExtraData = []byte("BEDROCK")
 
 // NewL2Genesis will create a new L2 genesis
 func NewL2Genesis(config *DeployConfig, block *types.Block) (*core.Genesis, error) {
@@ -38,7 +42,6 @@ func NewL2Genesis(config *DeployConfig, block *types.Block) (*core.Genesis, erro
 		DAOForkBlock:                  nil,
 		DAOForkSupport:                false,
 		EIP150Block:                   big.NewInt(0),
-		EIP150Hash:                    common.Hash{},
 		EIP155Block:                   big.NewInt(0),
 		EIP158Block:                   big.NewInt(0),
 		ByzantiumBlock:                big.NewInt(0),
@@ -54,6 +57,7 @@ func NewL2Genesis(config *DeployConfig, block *types.Block) (*core.Genesis, erro
 		TerminalTotalDifficulty:       big.NewInt(0),
 		TerminalTotalDifficultyPassed: true,
 		BedrockBlock:                  new(big.Int).SetUint64(uint64(config.L2GenesisBlockNumber)),
+		RegolithTime:                  config.RegolithTime(block.Time()),
 		Optimism: &params.OptimismConfig{
 			EIP1559Denominator: eip1559Denom,
 			EIP1559Elasticity:  eip1559Elasticity,
@@ -62,7 +66,7 @@ func NewL2Genesis(config *DeployConfig, block *types.Block) (*core.Genesis, erro
 
 	gasLimit := config.L2GenesisBlockGasLimit
 	if gasLimit == 0 {
-		gasLimit = defaultL2GasLimit
+		gasLimit = defaultGasLimit
 	}
 	baseFee := config.L2GenesisBlockBaseFeePerGas
 	if baseFee == nil {
@@ -73,8 +77,13 @@ func NewL2Genesis(config *DeployConfig, block *types.Block) (*core.Genesis, erro
 		difficulty = newHexBig(0)
 	}
 
+	extraData := config.L2GenesisBlockExtraData
+	if extraData == nil {
+		// L2GenesisBlockExtraData is optional, so use a default value when nil
+		extraData = BedrockTransitionBlockExtraData
+	}
 	// Ensure that the extradata is valid
-	if size := len(BedrockTransitionBlockExtraData); size > 32 {
+	if size := len(extraData); size > 32 {
 		return nil, fmt.Errorf("transition block extradata too long: %d", size)
 	}
 
@@ -82,7 +91,7 @@ func NewL2Genesis(config *DeployConfig, block *types.Block) (*core.Genesis, erro
 		Config:     &optimismChainConfig,
 		Nonce:      uint64(config.L2GenesisBlockNonce),
 		Timestamp:  block.Time(),
-		ExtraData:  BedrockTransitionBlockExtraData,
+		ExtraData:  extraData,
 		GasLimit:   uint64(gasLimit),
 		Difficulty: difficulty.ToInt(),
 		Mixhash:    config.L2GenesisBlockMixHash,
@@ -107,7 +116,6 @@ func NewL1Genesis(config *DeployConfig) (*core.Genesis, error) {
 		DAOForkBlock:        nil,
 		DAOForkSupport:      false,
 		EIP150Block:         big.NewInt(0),
-		EIP150Hash:          common.Hash{},
 		EIP155Block:         big.NewInt(0),
 		EIP158Block:         big.NewInt(0),
 		ByzantiumBlock:      big.NewInt(0),
@@ -121,22 +129,25 @@ func NewL1Genesis(config *DeployConfig) (*core.Genesis, error) {
 		GrayGlacierBlock:    big.NewInt(0),
 	}
 
-	if config.CliqueSignerAddress != (common.Address{}) {
+	extraData := make([]byte, 0)
+	if config.L1UseClique {
 		// warning: clique has an overly strict block header timestamp check against the system wallclock,
 		// causing blocks to get scheduled as "future block" and not get mined instantly when produced.
 		chainConfig.Clique = &params.CliqueConfig{
 			Period: config.L1BlockTime,
 			Epoch:  30000,
 		}
+		extraData = append(append(make([]byte, 32), config.CliqueSignerAddress[:]...), make([]byte, crypto.SignatureLength)...)
 	} else {
 		chainConfig.MergeNetsplitBlock = big.NewInt(0)
 		chainConfig.TerminalTotalDifficulty = big.NewInt(0)
 		chainConfig.TerminalTotalDifficultyPassed = true
+		chainConfig.ShanghaiTime = u64ptr(0)
 	}
 
 	gasLimit := config.L1GenesisBlockGasLimit
 	if gasLimit == 0 {
-		gasLimit = 15_000_000
+		gasLimit = defaultGasLimit
 	}
 	baseFee := config.L1GenesisBlockBaseFeePerGas
 	if baseFee == nil {
@@ -149,11 +160,6 @@ func NewL1Genesis(config *DeployConfig) (*core.Genesis, error) {
 	timestamp := config.L1GenesisBlockTimestamp
 	if timestamp == 0 {
 		timestamp = hexutil.Uint64(time.Now().Unix())
-	}
-
-	extraData := make([]byte, 0)
-	if config.CliqueSignerAddress != (common.Address{}) {
-		extraData = append(append(make([]byte, 32), config.CliqueSignerAddress[:]...), make([]byte, crypto.SignatureLength)...)
 	}
 
 	return &core.Genesis{
@@ -171,4 +177,8 @@ func NewL1Genesis(config *DeployConfig) (*core.Genesis, error) {
 		BaseFee:    baseFee.ToInt(),
 		Alloc:      map[common.Address]core.GenesisAccount{},
 	}, nil
+}
+
+func u64ptr(n uint64) *uint64 {
+	return &n
 }

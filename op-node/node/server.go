@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 
+	ophttp "github.com/ethereum-optimism/optimism/op-node/http"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -36,7 +37,6 @@ func newRPCServer(ctx context.Context, rpcCfg *RPCConfig, rollupCfg *rollup.Conf
 		apis: []rpc.API{{
 			Namespace:     "optimism",
 			Service:       api,
-			Public:        true,
 			Authenticated: false,
 		}},
 		appVersion: appVersion,
@@ -50,7 +50,6 @@ func (s *rpcServer) EnableAdminAPI(api *adminAPI) {
 		Namespace:     "admin",
 		Version:       "",
 		Service:       api,
-		Public:        true, // TODO: this field is deprecated. Do we even need this anymore?
 		Authenticated: false,
 	})
 }
@@ -60,7 +59,6 @@ func (s *rpcServer) EnableP2P(backend *p2p.APIBackend) {
 		Namespace:     p2p.NamespaceRPC,
 		Version:       "",
 		Service:       backend,
-		Public:        true,
 		Authenticated: false,
 	})
 }
@@ -87,7 +85,7 @@ func (s *rpcServer) Start() error {
 	}
 	s.listenAddr = listener.Addr()
 
-	s.httpServer = &http.Server{Handler: mux}
+	s.httpServer = ophttp.NewHttpServer(mux)
 	go func() {
 		if err := s.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) { // todo improve error handling
 			s.log.Error("http server failed", "err", err)

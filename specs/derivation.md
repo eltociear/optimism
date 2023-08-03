@@ -107,7 +107,7 @@ To derive the L2 blocks in an epoch `E`, we need the following inputs:
   is the sequencing window size (note that this means that epochs are overlapping). In particular, we need:
   - The [batcher transactions][g-batcher-transaction] included in the sequencing window. These allow us to
       reconstruct [sequencer batches][g-sequencer-batch] containing the transactions to include in L2 blocks (each batch
-      maps to a single L2 block).
+      contains a list of L2 blocks).
     - Note that it is impossible to have a batcher transaction containing a batch relative to epoch `E` on L1 block
         `E`, as the batch must contain the hash of L1 block `E`.
   - The [deposits][g-deposits] made in L1 block `E` (in the form of events emitted by the [deposit
@@ -285,9 +285,7 @@ As for the comment on "security types", it explains the classification of blocks
 
 - [Unsafe L2 blocks][g-unsafe-l2-block]:
 - [Safe L2 blocks][g-safe-l2-block]:
-- Finalized L2 blocks: currently the same as the safe L2 block, but could be changed in the future to refer to block
-  that have been derived from [finalized][g-finalized-l2-head] L1 data, or alternatively, from L1 blacks that are older
-  than the [challenge period].
+- Finalized L2 blocks: refer to block that have been derived from [finalized][g-finalized-l2-head] L1 data.
 
 These security levels map to the `headBlockHash`, `safeBlockHash` and `finalizedBlockHash` values transmitted when
 interacting with the [execution-engine API][exec-engine].
@@ -517,12 +515,14 @@ New frames for timed-out channels are dropped instead of buffered.
 
 The channel-bank can only output data from the first opened channel.
 
-Upon reading, first all timed-out channels are dropped.
+Upon reading, while the first opened channel is timed-out, remove it from the channel-bank.
 
-After pruning timed-out channels, the first remaining channel, if any, is read if it is ready:
+Once the first opened channel, if any, is not timed-out and is ready, then it is read and removed from the channel-bank.
 
-- The channel must be closed
-- The channel must have a contiguous sequence of frames until the closing frame
+A channel is ready if:
+
+- The channel is closed
+- The channel has a contiguous sequence of frames until the closing frame
 
 If no channel is ready, the next frame is read and ingested into the channel bank.
 
@@ -533,11 +533,15 @@ a new channel is opened, tagged with the current L1 block, and appended to the c
 
 Frame insertion conditions:
 
-- New frames matching existing timed-out channels are dropped.
-- Duplicate frames (by frame number) are dropped.
-- Duplicate closes (new frame `is_last == 1`, but the channel has already seen a closing frame) are dropped.
+- New frames matching timed-out channels that have not yet been pruned from the channel-bank are dropped.
+- Duplicate frames (by frame number) for frames that have not yet been pruned from the channel-bank are dropped.
+- Duplicate closes (new frame `is_last == 1`, but the channel has already seen a closing frame and has not yet been
+    pruned from the channel-bank) are dropped.
 
 If a frame is closing (`is_last == 1`) any existing higher-numbered frames are removed from the channel.
+
+Note that while this allows channel IDs to be reused once they have been pruned from the channel-bank, it is recommended
+that batcher implementations use unique channel IDs.
 
 ### Channel Reader (Batch Decoding)
 
@@ -928,10 +932,11 @@ follows:
 
 - `timestamp` is set to the batch's timestamp.
 - `random` is set to the `prev_randao` L1 block attribute.
-- `suggestedFeeRecipient` is set to an address determined by the sequencer.
+- `suggestedFeeRecipient` is set to the Sequencer Fee Vault address. See [Fee Vaults] specification.
 - `transactions` is the array of the derived transactions: deposited transactions and sequenced transactions, all
   encoded with [EIP-2718].
 - `noTxPool` is set to `true`, to use the exact above `transactions` list when constructing the block.
 - `gasLimit` is set to the current `gasLimit` value in the [system configuration][g-system-config] of this payload.
 
 [extended-attributes]: exec-engine.md#extended-payloadattributesv1
+[Fee Vaults]: exec-engine.md#fee-vaults

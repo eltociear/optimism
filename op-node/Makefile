@@ -9,7 +9,7 @@ LDFLAGSSTRING +=-X github.com/ethereum-optimism/optimism/op-node/version.Meta=$(
 LDFLAGS := -ldflags "$(LDFLAGSSTRING)"
 
 op-node:
-	env GO111MODULE=on go build -v $(LDFLAGS) -o ./bin/op-node ./cmd/main.go
+	env GO111MODULE=on GOOS=$(TARGETOS) GOARCH=$(TARGETARCH) go build -v $(LDFLAGS) -o ./bin/op-node ./cmd/main.go
 
 clean:
 	rm bin/op-node
@@ -37,10 +37,13 @@ fuzz:
 	go test -run NOTAREALTEST -v -fuzztime 10s -fuzz FuzzRejectCreateBlockBadTimestamp ./rollup/driver
 	go test -run NOTAREALTEST -v -fuzztime 10s -fuzz FuzzDecodeDepositTxDataToL1Info ./rollup/driver
 
+generate-mocks:
+	go generate ./...
 
 .PHONY: \
 	op-node \
 	clean \
 	test \
 	lint \
-	fuzz
+	fuzz \
+	generate-mocks

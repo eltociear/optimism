@@ -1,29 +1,37 @@
 package rollup
 
 import (
+	"errors"
+
 	"github.com/ethereum-optimism/optimism/op-bindings/bindings"
 	"github.com/ethereum-optimism/optimism/op-node/eth"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
 )
 
-// ComputeL2OutputRoot computes the L2 output root
-func ComputeL2OutputRoot(l2OutputRootVersion eth.Bytes32, blockHash common.Hash, blockRoot common.Hash, storageRoot common.Hash) eth.Bytes32 {
-	digest := crypto.Keccak256Hash(
-		l2OutputRootVersion[:],
-		blockRoot.Bytes(),
-		storageRoot[:],
-		blockHash.Bytes(),
-	)
-	return eth.Bytes32(digest)
+var ErrNilProof = errors.New("output root proof is nil")
+
+// ComputeL2OutputRoot computes the L2 output root by hashing an output root proof.
+func ComputeL2OutputRoot(proofElements *bindings.TypesOutputRootProof) (eth.Bytes32, error) {
+	if proofElements == nil {
+		return eth.Bytes32{}, ErrNilProof
+	}
+
+	if eth.Bytes32(proofElements.Version) != eth.OutputVersionV0 {
+		return eth.Bytes32{}, errors.New("unsupported output root version")
+	}
+	l2Output := eth.OutputV0{
+		StateRoot:                eth.Bytes32(proofElements.StateRoot),
+		MessagePasserStorageRoot: proofElements.MessagePasserStorageRoot,
+		BlockHash:                proofElements.LatestBlockhash,
+	}
+	return eth.OutputRoot(&l2Output), nil
 }
 
-// HashOutputRootProof computes the hash of the output root proof
-func HashOutputRootProof(proof *bindings.TypesOutputRootProof) eth.Bytes32 {
-	return ComputeL2OutputRoot(
-		proof.Version,
-		proof.StateRoot,
-		proof.MessagePasserStorageRoot,
-		proof.LatestBlockhash,
-	)
+func ComputeL2OutputRootV0(block eth.BlockInfo, storageRoot [32]byte) (eth.Bytes32, error) {
+	stateRoot := block.Root()
+	l2Output := eth.OutputV0{
+		StateRoot:                eth.Bytes32(stateRoot),
+		MessagePasserStorageRoot: storageRoot,
+		BlockHash:                block.Hash(),
+	}
+	return eth.OutputRoot(&l2Output), nil
 }

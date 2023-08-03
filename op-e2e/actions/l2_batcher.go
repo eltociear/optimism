@@ -16,6 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethereum-optimism/optimism/op-batcher/compressor"
 	"github.com/ethereum-optimism/optimism/op-node/eth"
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
@@ -91,6 +92,10 @@ func (s *L2Batcher) SubmittingData() bool {
 // ActL2BatchBuffer adds the next L2 block to the batch buffer.
 // If the buffer is being submitted, the buffer is wiped.
 func (s *L2Batcher) ActL2BatchBuffer(t Testing) {
+	require.NoError(t, s.Buffer(t), "failed to add block to channel")
+}
+
+func (s *L2Batcher) Buffer(t Testing) error {
 	if s.l2Submitting { // break ongoing submitting work if necessary
 		s.l2ChannelOut = nil
 		s.l2Submitting = false
@@ -120,7 +125,7 @@ func (s *L2Batcher) ActL2BatchBuffer(t Testing) {
 			s.l2ChannelOut = nil
 		} else {
 			s.log.Info("nothing left to submit")
-			return
+			return nil
 		}
 	}
 	// Create channel if we don't have one yet
@@ -129,7 +134,13 @@ func (s *L2Batcher) ActL2BatchBuffer(t Testing) {
 		if s.l2BatcherCfg.GarbageCfg != nil {
 			ch, err = NewGarbageChannelOut(s.l2BatcherCfg.GarbageCfg)
 		} else {
-			ch, err = derive.NewChannelOut()
+			c, e := compressor.NewRatioCompressor(compressor.Config{
+				TargetFrameSize:  s.l2BatcherCfg.MaxL1TxSize,
+				TargetNumFrames:  1,
+				ApproxComprRatio: 1,
+			})
+			require.NoError(t, e, "failed to create compressor")
+			ch, err = derive.NewChannelOut(c)
 		}
 		require.NoError(t, err, "failed to create channel")
 		s.l2ChannelOut = ch
@@ -143,9 +154,10 @@ func (s *L2Batcher) ActL2BatchBuffer(t Testing) {
 		s.l2ChannelOut = nil
 	}
 	if _, err := s.l2ChannelOut.AddBlock(block); err != nil { // should always succeed
-		t.Fatalf("failed to add block to channel: %v", err)
+		return err
 	}
 	s.l2BufferedBlock = eth.ToBlockID(block)
+	return nil
 }
 
 func (s *L2Batcher) ActL2ChannelClose(t Testing) {
@@ -158,7 +170,7 @@ func (s *L2Batcher) ActL2ChannelClose(t Testing) {
 }
 
 // ActL2BatchSubmit constructs a batch tx from previous buffered L2 blocks, and submits it to L1
-func (s *L2Batcher) ActL2BatchSubmit(t Testing) {
+func (s *L2Batcher) ActL2BatchSubmit(t Testing, txOpts ...func(tx *types.DynamicFeeTx)) {
 	// Don't run this action if there's no data to submit
 	if s.l2ChannelOut == nil {
 		t.InvalidAction("need to buffer data first, cannot batch submit with empty buffer")
@@ -191,6 +203,9 @@ func (s *L2Batcher) ActL2BatchSubmit(t Testing) {
 		GasTipCap: gasTipCap,
 		GasFeeCap: gasFeeCap,
 		Data:      data.Bytes(),
+	}
+	for _, opt := range txOpts {
+		opt(rawTx)
 	}
 	gas, err := core.IntrinsicGas(rawTx.Data, nil, false, true, true, false)
 	require.NoError(t, err, "need to compute intrinsic gas")

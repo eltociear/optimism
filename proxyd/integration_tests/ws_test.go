@@ -2,14 +2,14 @@ package integration_tests
 
 import (
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/log"
-
 	"github.com/ethereum-optimism/optimism/proxyd"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +38,7 @@ func TestConcurrentWSPanic(t *testing.T) {
 	require.NoError(t, os.Setenv("GOOD_BACKEND_RPC_URL", backend.URL()))
 
 	config := ReadConfig("ws")
-	shutdown, err := proxyd.Start(config)
+	_, shutdown, err := proxyd.Start(config)
 	require.NoError(t, err)
 	client, err := NewProxydWSClient("ws://127.0.0.1:8546", nil, nil)
 	require.NoError(t, err)
@@ -147,7 +147,7 @@ func TestWS(t *testing.T) {
 	require.NoError(t, os.Setenv("GOOD_BACKEND_RPC_URL", backend.URL()))
 
 	config := ReadConfig("ws")
-	shutdown, err := proxyd.Start(config)
+	_, shutdown, err := proxyd.Start(config)
 	require.NoError(t, err)
 	client, err := NewProxydWSClient("ws://127.0.0.1:8546", func(msgType int, data []byte) {
 		clientHdlr.MsgCB(msgType, data)
@@ -201,7 +201,7 @@ func TestWS(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			timeout := time.NewTicker(30 * time.Second)
+			timeout := time.NewTicker(10 * time.Second)
 			doneCh := make(chan struct{}, 1)
 			backendHdlr.SetMsgCB(func(conn *websocket.Conn, msgType int, data []byte) {
 				require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(tt.backendRes)))
@@ -238,7 +238,7 @@ func TestWSClientClosure(t *testing.T) {
 	require.NoError(t, os.Setenv("GOOD_BACKEND_RPC_URL", backend.URL()))
 
 	config := ReadConfig("ws")
-	shutdown, err := proxyd.Start(config)
+	_, shutdown, err := proxyd.Start(config)
 	require.NoError(t, err)
 	defer shutdown()
 
@@ -271,31 +271,47 @@ func TestWSClientClosure(t *testing.T) {
 	}
 }
 
-func TestWSClientMaxConns(t *testing.T) {
-	backend := NewMockWSBackend(nil, nil, nil)
+func TestWSClientExceedReadLimit(t *testing.T) {
+	backendHdlr := new(backendHandler)
+	clientHdlr := new(clientHandler)
+
+	backend := NewMockWSBackend(nil, func(conn *websocket.Conn, msgType int, data []byte) {
+		backendHdlr.MsgCB(conn, msgType, data)
+	}, func(conn *websocket.Conn, err error) {
+		backendHdlr.CloseCB(conn, err)
+	})
 	defer backend.Close()
 
 	require.NoError(t, os.Setenv("GOOD_BACKEND_RPC_URL", backend.URL()))
 
 	config := ReadConfig("ws")
-	shutdown, err := proxyd.Start(config)
+	_, shutdown, err := proxyd.Start(config)
 	require.NoError(t, err)
 	defer shutdown()
 
-	doneCh := make(chan struct{}, 1)
-	_, err = NewProxydWSClient("ws://127.0.0.1:8546", nil, nil)
-	require.NoError(t, err)
-	_, err = NewProxydWSClient("ws://127.0.0.1:8546", nil, func(err error) {
-		require.Contains(t, err.Error(), "unexpected EOF")
-		doneCh <- struct{}{}
-	})
+	client, err := NewProxydWSClient("ws://127.0.0.1:8546", func(msgType int, data []byte) {
+		clientHdlr.MsgCB(msgType, data)
+	}, nil)
 	require.NoError(t, err)
 
-	timeout := time.NewTicker(30 * time.Second)
-	select {
-	case <-timeout.C:
-		t.Fatalf("timed out")
-	case <-doneCh:
-		return
-	}
+	closed := false
+	originalHandler := client.conn.CloseHandler()
+	client.conn.SetCloseHandler(func(code int, text string) error {
+		closed = true
+		return originalHandler(code, text)
+	})
+
+	backendHdlr.SetMsgCB(func(conn *websocket.Conn, msgType int, data []byte) {
+		t.Fatalf("backend should not get the large message")
+	})
+
+	payload := strings.Repeat("barf", 1024*1024)
+	clientReq := "{\"id\": 1, \"method\": \"eth_subscribe\", \"params\": [\"" + payload + "\"]}"
+	err = client.WriteMessage(
+		websocket.TextMessage,
+		[]byte(clientReq),
+	)
+	require.Error(t, err)
+	require.True(t, closed)
+
 }

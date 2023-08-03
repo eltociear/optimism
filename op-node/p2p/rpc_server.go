@@ -7,7 +7,10 @@ import (
 	"net"
 	"time"
 
+	"github.com/ethereum-optimism/optimism/op-node/p2p/gating"
+
 	decredSecp "github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/ethereum-optimism/optimism/op-node/p2p/store"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p-testing/netutil"
 	"github.com/libp2p/go-libp2p/core/connmgr"
@@ -30,9 +33,9 @@ import (
 // - banning peers based on score
 
 var (
-	DisabledDiscovery   = errors.New("discovery disabled")
-	NoConnectionManager = errors.New("no connection manager")
-	NoConnectionGater   = errors.New("no connection gater")
+	ErrDisabledDiscovery   = errors.New("discovery disabled")
+	ErrNoConnectionManager = errors.New("no connection manager")
+	ErrNoConnectionGater   = errors.New("no connection gater")
 )
 
 type Node interface {
@@ -47,7 +50,7 @@ type Node interface {
 	// GossipOut returns the gossip output/info control
 	GossipOut() GossipOut
 	// ConnectionGater returns the connection gater, to ban/unban peers with, may be nil
-	ConnectionGater() ConnectionGater
+	ConnectionGater() gating.BlockingConnectionGater
 	// ConnectionManager returns the connection manager, to protect peers with, may be nil
 	ConnectionManager() connmgr.ConnManager
 }
@@ -106,6 +109,11 @@ func dumpPeer(id peer.ID, nw network.Network, pstore peerstore.Peerstore, connMg
 				return nil, fmt.Errorf("unexpected pubkey type: %T", pub)
 			}
 			info.NodeID = enode.PubkeyToIDV4((*decredSecp.PublicKey)(typedPub).ToECDSA())
+		}
+	}
+	if eps, ok := pstore.(store.ExtendedPeerstore); ok {
+		if dat, err := eps.GetPeerScores(id); err == nil {
+			info.PeerScores = dat
 		}
 	}
 	if dat, err := pstore.Get(id, "ProtocolVersion"); err == nil {
@@ -236,7 +244,7 @@ func (s *APIBackend) DiscoveryTable(_ context.Context) ([]*enode.Node, error) {
 	if dv5 := s.node.Dv5Udp(); dv5 != nil {
 		return dv5.AllNodes(), nil
 	} else {
-		return nil, DisabledDiscovery
+		return nil, ErrDisabledDiscovery
 	}
 }
 
@@ -244,7 +252,7 @@ func (s *APIBackend) BlockPeer(_ context.Context, p peer.ID) error {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_blockPeer")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return NoConnectionGater
+		return ErrNoConnectionGater
 	} else {
 		return gater.BlockPeer(p)
 	}
@@ -254,7 +262,7 @@ func (s *APIBackend) UnblockPeer(_ context.Context, p peer.ID) error {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_unblockPeer")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return NoConnectionGater
+		return ErrNoConnectionGater
 	} else {
 		return gater.UnblockPeer(p)
 	}
@@ -264,7 +272,7 @@ func (s *APIBackend) ListBlockedPeers(_ context.Context) ([]peer.ID, error) {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_listBlockedPeers")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return nil, NoConnectionGater
+		return nil, ErrNoConnectionGater
 	} else {
 		return gater.ListBlockedPeers(), nil
 	}
@@ -276,7 +284,7 @@ func (s *APIBackend) BlockAddr(_ context.Context, ip net.IP) error {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_blockAddr")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return NoConnectionGater
+		return ErrNoConnectionGater
 	} else {
 		return gater.BlockAddr(ip)
 	}
@@ -286,7 +294,7 @@ func (s *APIBackend) UnblockAddr(_ context.Context, ip net.IP) error {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_unblockAddr")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return NoConnectionGater
+		return ErrNoConnectionGater
 	} else {
 		return gater.UnblockAddr(ip)
 	}
@@ -296,7 +304,7 @@ func (s *APIBackend) ListBlockedAddrs(_ context.Context) ([]net.IP, error) {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_listBlockedAddrs")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return nil, NoConnectionGater
+		return nil, ErrNoConnectionGater
 	} else {
 		return gater.ListBlockedAddrs(), nil
 	}
@@ -308,7 +316,7 @@ func (s *APIBackend) BlockSubnet(_ context.Context, ipnet *net.IPNet) error {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_blockSubnet")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return NoConnectionGater
+		return ErrNoConnectionGater
 	} else {
 		return gater.BlockSubnet(ipnet)
 	}
@@ -318,7 +326,7 @@ func (s *APIBackend) UnblockSubnet(_ context.Context, ipnet *net.IPNet) error {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_unblockSubnet")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return NoConnectionGater
+		return ErrNoConnectionGater
 	} else {
 		return gater.UnblockSubnet(ipnet)
 	}
@@ -328,7 +336,7 @@ func (s *APIBackend) ListBlockedSubnets(_ context.Context) ([]*net.IPNet, error)
 	recordDur := s.m.RecordRPCServerRequest("opp2p_listBlockedSubnets")
 	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
-		return nil, NoConnectionGater
+		return nil, ErrNoConnectionGater
 	} else {
 		return gater.ListBlockedSubnets(), nil
 	}
@@ -338,7 +346,7 @@ func (s *APIBackend) ProtectPeer(_ context.Context, p peer.ID) error {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_protectPeer")
 	defer recordDur()
 	if manager := s.node.ConnectionManager(); manager == nil {
-		return NoConnectionManager
+		return ErrNoConnectionManager
 	} else {
 		manager.Protect(p, "api-protected")
 		return nil
@@ -349,7 +357,7 @@ func (s *APIBackend) UnprotectPeer(_ context.Context, p peer.ID) error {
 	recordDur := s.m.RecordRPCServerRequest("opp2p_unprotectPeer")
 	defer recordDur()
 	if manager := s.node.ConnectionManager(); manager == nil {
-		return NoConnectionManager
+		return ErrNoConnectionManager
 	} else {
 		manager.Unprotect(p, "api-protected")
 		return nil

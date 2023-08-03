@@ -102,12 +102,15 @@ func currentHeads(ctx context.Context, cfg *rollup.Config, l2 L2Chain) (*FindHea
 // Plausible: meaning that the blockhash of the L2 block's L1 origin
 // (as reported in the L1 Attributes deposit within the L2 block) is not canonical at another height in the L1 chain,
 // and the same holds for all its ancestors.
-func FindL2Heads(ctx context.Context, cfg *rollup.Config, l1 L1Chain, l2 L2Chain, lgr log.Logger) (result *FindHeadsResult, err error) {
+func FindL2Heads(ctx context.Context, cfg *rollup.Config, l1 L1Chain, l2 L2Chain, lgr log.Logger, syncCfg *Config) (result *FindHeadsResult, err error) {
 	// Fetch current L2 forkchoice state
 	result, err = currentHeads(ctx, cfg, l2)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch current L2 forkchoice state: %w", err)
 	}
+
+	lgr.Info("Loaded current L2 heads", "unsafe", result.Unsafe, "safe", result.Safe, "finalized", result.Finalized,
+		"unsafe_origin", result.Unsafe.L1Origin, "safe_origin", result.Safe.L1Origin)
 
 	// Remember original unsafe block to determine reorg depth
 	prevUnsafe := result.Unsafe
@@ -126,8 +129,18 @@ func FindL2Heads(ctx context.Context, cfg *rollup.Config, l1 L1Chain, l2 L2Chain
 	// then we return the last L2 block of the epoch before that as safe head.
 	// Each loop iteration we traverse a single L2 block, and we check if the L1 origins are consistent.
 	for {
-		// Fetch L1 information if we never had it, or if we do not have it for the current origin
-		if l1Block == (eth.L1BlockRef{}) || n.L1Origin.Hash != l1Block.Hash {
+		// Fetch L1 information if we never had it, or if we do not have it for the current origin.
+		// Optimization: as soon as we have a previous L1 block, try to traverse L1 by hash instead of by number, to fill the cache.
+		if n.L1Origin.Hash == l1Block.ParentHash {
+			b, err := l1.L1BlockRefByHash(ctx, n.L1Origin.Hash)
+			if err != nil {
+				// Exit, find-sync start should start over, to move to an available L1 chain with block-by-number / not-found case.
+				return nil, fmt.Errorf("failed to retrieve L1 block: %w", err)
+			}
+			lgr.Info("Walking back L1Block by hash", "curr", l1Block, "next", b, "l2block", n)
+			l1Block = b
+			ahead = false
+		} else if l1Block == (eth.L1BlockRef{}) || n.L1Origin.Hash != l1Block.Hash {
 			b, err := l1.L1BlockRefByNumber(ctx, n.L1Origin.Number)
 			// if L2 is ahead of L1 view, then consider it a "plausible" head
 			notFound := errors.Is(err, ethereum.NotFound)
@@ -136,9 +149,10 @@ func FindL2Heads(ctx context.Context, cfg *rollup.Config, l1 L1Chain, l2 L2Chain
 			}
 			l1Block = b
 			ahead = notFound
+			lgr.Info("Walking back L1Block by number", "curr", l1Block, "next", b, "l2block", n)
 		}
 
-		lgr.Trace("walking sync start", "number", n.Number)
+		lgr.Trace("walking sync start", "l2block", n)
 
 		// Don't walk past genesis. If we were at the L2 genesis, but could not find its L1 origin,
 		// the L2 chain is building on the wrong L1 branch.
@@ -156,18 +170,18 @@ func FindL2Heads(ctx context.Context, cfg *rollup.Config, l1 L1Chain, l2 L2Chain
 		if (n.Number == result.Finalized.Number) && (n.Hash != result.Finalized.Hash) {
 			return nil, fmt.Errorf("%w: finalized %s, got: %s", ReorgFinalizedErr, result.Finalized, n)
 		}
-		// Check we are not reorging L2 incredibly deep
-		if n.L1Origin.Number+(MaxReorgSeqWindows*cfg.SeqWindowSize) < prevUnsafe.L1Origin.Number {
-			// If the reorg depth is too large, something is fishy.
-			// This can legitimately happen if L1 goes down for a while. But in that case,
-			// restarting the L2 node with a bigger configured MaxReorgDepth is an acceptable
-			// stopgap solution.
-			return nil, fmt.Errorf("%w: traversed back to L2 block %s, but too deep compared to previous unsafe block %s", TooDeepReorgErr, n, prevUnsafe)
-		}
 
 		// If we don't have a usable unsafe head, then set it
 		if result.Unsafe == (eth.L2BlockRef{}) {
 			result.Unsafe = n
+			// Check we are not reorging L2 incredibly deep
+			if n.L1Origin.Number+(MaxReorgSeqWindows*cfg.SeqWindowSize) < prevUnsafe.L1Origin.Number {
+				// If the reorg depth is too large, something is fishy.
+				// This can legitimately happen if L1 goes down for a while. But in that case,
+				// restarting the L2 node with a bigger configured MaxReorgDepth is an acceptable
+				// stopgap solution.
+				return nil, fmt.Errorf("%w: traversed back to L2 block %s, but too deep compared to previous unsafe block %s", TooDeepReorgErr, n, prevUnsafe)
+			}
 		}
 
 		if ahead {
@@ -192,10 +206,17 @@ func FindL2Heads(ctx context.Context, cfg *rollup.Config, l1 L1Chain, l2 L2Chain
 
 		// Don't traverse further than the finalized head to find a safe head
 		if n.Number == result.Finalized.Number {
+			lgr.Info("Hit finalized L2 head, returning immediately", "unsafe", result.Unsafe, "safe", result.Safe,
+				"finalized", result.Finalized, "unsafe_origin", result.Unsafe.L1Origin, "safe_origin", result.Safe.L1Origin)
 			result.Safe = n
 			return result, nil
 		}
 
+		if syncCfg.SkipSyncStartCheck && highestL2WithCanonicalL1Origin.Hash == n.Hash {
+			lgr.Info("Found highest L2 block with canonical L1 origin. Skip further sanity check and jump to the safe head")
+			n = result.Safe
+			continue
+		}
 		// Pull L2 parent for next iteration
 		parent, err := l2.L2BlockRefByHash(ctx, n.ParentHash)
 		if err != nil {

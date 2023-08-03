@@ -1,5 +1,26 @@
 # @eth-optimism/common-ts
 
+## 0.8.3
+
+### Patch Changes
+
+- Updated dependencies [[`c11039060`](https://github.com/ethereum-optimism/optimism/commit/c11039060bc037a88916c2cba602687b6d69ad1a), [`77da6edc6`](https://github.com/ethereum-optimism/optimism/commit/77da6edc643e0b5e39f7b6bb41c3c7ead418a876)]:
+  - @eth-optimism/core-utils@0.12.2
+
+## 0.8.2
+
+### Patch Changes
+
+- Updated dependencies [8d7dcc70c]
+- Updated dependencies [d6388be4a]
+  - @eth-optimism/core-utils@0.12.1
+
+## 0.8.1
+
+### Patch Changes
+
+- fecd42d67: Fix BaseServiceV2 configuration for caseCase options
+
 ## 0.8.0
 
 ### Minor Changes

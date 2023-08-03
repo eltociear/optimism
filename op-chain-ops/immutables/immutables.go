@@ -6,6 +6,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 
 	"github.com/ethereum-optimism/optimism/op-bindings/bindings"
 	"github.com/ethereum-optimism/optimism/op-bindings/predeploys"
@@ -95,18 +96,24 @@ func BuildOptimism(immutable ImmutableConfig) (DeploymentResults, error) {
 			Name: "SequencerFeeVault",
 			Args: []interface{}{
 				immutable["SequencerFeeVault"]["recipient"],
+				immutable["SequencerFeeVault"]["minimumWithdrawalAmount"],
+				immutable["SequencerFeeVault"]["withdrawalNetwork"],
 			},
 		},
 		{
 			Name: "BaseFeeVault",
 			Args: []interface{}{
 				immutable["BaseFeeVault"]["recipient"],
+				immutable["BaseFeeVault"]["minimumWithdrawalAmount"],
+				immutable["BaseFeeVault"]["withdrawalNetwork"],
 			},
 		},
 		{
 			Name: "L1FeeVault",
 			Args: []interface{}{
 				immutable["L1FeeVault"]["recipient"],
+				immutable["L1FeeVault"]["minimumWithdrawalAmount"],
+				immutable["L1FeeVault"]["withdrawalNetwork"],
 			},
 		},
 		{
@@ -138,6 +145,12 @@ func BuildOptimism(immutable ImmutableConfig) (DeploymentResults, error) {
 		{
 			Name: "LegacyERC20ETH",
 		},
+		{
+			Name: "EAS",
+		},
+		{
+			Name: "SchemaRegistry",
+		},
 	}
 	return BuildL2(deployments)
 }
@@ -146,7 +159,8 @@ func BuildOptimism(immutable ImmutableConfig) (DeploymentResults, error) {
 // can be properly set. The bytecode returned in the results is suitable to be
 // inserted into the state via state surgery.
 func BuildL2(constructors []deployer.Constructor) (DeploymentResults, error) {
-	deployments, err := deployer.Deploy(deployer.NewBackend(), constructors, l2Deployer)
+	log.Info("Creating L2 state")
+	deployments, err := deployer.Deploy(deployer.NewL2Backend(), constructors, l2Deployer)
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +173,9 @@ func BuildL2(constructors []deployer.Constructor) (DeploymentResults, error) {
 
 func l2Deployer(backend *backends.SimulatedBackend, opts *bind.TransactOpts, deployment deployer.Constructor) (*types.Transaction, error) {
 	var tx *types.Transaction
+	var recipient common.Address
+	var minimumWithdrawalAmount *big.Int
+	var withdrawalNetwork uint8
 	var err error
 	switch deployment.Name {
 	case "GasPriceOracle":
@@ -182,23 +199,23 @@ func l2Deployer(backend *backends.SimulatedBackend, opts *bind.TransactOpts, dep
 		// No arguments required for L2ToL1MessagePasser
 		_, tx, _, err = bindings.DeployL2ToL1MessagePasser(opts, backend)
 	case "SequencerFeeVault":
-		recipient, ok := deployment.Args[0].(common.Address)
-		if !ok {
-			return nil, fmt.Errorf("invalid type for recipient")
+		recipient, minimumWithdrawalAmount, withdrawalNetwork, err = prepareFeeVaultArguments(deployment)
+		if err != nil {
+			return nil, err
 		}
-		_, tx, _, err = bindings.DeploySequencerFeeVault(opts, backend, recipient)
+		_, tx, _, err = bindings.DeploySequencerFeeVault(opts, backend, recipient, minimumWithdrawalAmount, withdrawalNetwork)
 	case "BaseFeeVault":
-		recipient, ok := deployment.Args[0].(common.Address)
-		if !ok {
-			return nil, fmt.Errorf("invalid type for recipient")
+		recipient, minimumWithdrawalAmount, withdrawalNetwork, err = prepareFeeVaultArguments(deployment)
+		if err != nil {
+			return nil, err
 		}
-		_, tx, _, err = bindings.DeployBaseFeeVault(opts, backend, recipient)
+		_, tx, _, err = bindings.DeployBaseFeeVault(opts, backend, recipient, minimumWithdrawalAmount, withdrawalNetwork)
 	case "L1FeeVault":
-		recipient, ok := deployment.Args[0].(common.Address)
-		if !ok {
-			return nil, fmt.Errorf("invalid type for recipient")
+		recipient, minimumWithdrawalAmount, withdrawalNetwork, err = prepareFeeVaultArguments(deployment)
+		if err != nil {
+			return nil, err
 		}
-		_, tx, _, err = bindings.DeployL1FeeVault(opts, backend, recipient)
+		_, tx, _, err = bindings.DeployL1FeeVault(opts, backend, recipient, minimumWithdrawalAmount, withdrawalNetwork)
 	case "OptimismMintableERC20Factory":
 		_, tx, _, err = bindings.DeployOptimismMintableERC20Factory(opts, backend, predeploys.L2StandardBridgeAddr)
 	case "DeployerWhitelist":
@@ -230,9 +247,29 @@ func l2Deployer(backend *backends.SimulatedBackend, opts *bind.TransactOpts, dep
 		_, tx, _, err = bindings.DeployOptimismMintableERC721Factory(opts, backend, bridge, remoteChainId)
 	case "LegacyERC20ETH":
 		_, tx, _, err = bindings.DeployLegacyERC20ETH(opts, backend)
+	case "EAS":
+		_, tx, _, err = bindings.DeployEAS(opts, backend)
+	case "SchemaRegistry":
+		_, tx, _, err = bindings.DeploySchemaRegistry(opts, backend)
 	default:
 		return tx, fmt.Errorf("unknown contract: %s", deployment.Name)
 	}
 
 	return tx, err
+}
+
+func prepareFeeVaultArguments(deployment deployer.Constructor) (common.Address, *big.Int, uint8, error) {
+	recipient, ok := deployment.Args[0].(common.Address)
+	if !ok {
+		return common.Address{}, nil, 0, fmt.Errorf("invalid type for recipient")
+	}
+	minimumWithdrawalAmountHex, ok := deployment.Args[1].(*hexutil.Big)
+	if !ok {
+		return common.Address{}, nil, 0, fmt.Errorf("invalid type for minimumWithdrawalAmount")
+	}
+	withdrawalNetwork, ok := deployment.Args[2].(uint8)
+	if !ok {
+		return common.Address{}, nil, 0, fmt.Errorf("invalid type for withdrawalNetwork")
+	}
+	return recipient, minimumWithdrawalAmountHex.ToInt(), withdrawalNetwork, nil
 }

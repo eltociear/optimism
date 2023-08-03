@@ -4,8 +4,6 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
-
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 
@@ -39,6 +37,7 @@ func TestL2Sequencer_SequencerDrift(gt *testing.T) {
 		MaxSequencerDrift:   20, // larger than L1 block time we simulate in this test (12)
 		SequencerWindowSize: 24,
 		ChannelTimeout:      20,
+		L1BlockTime:         12,
 	}
 	dp := e2eutils.MakeDeployParams(t, p)
 	sd := e2eutils.Setup(t, dp, defaultAlloc)
@@ -57,7 +56,7 @@ func TestL2Sequencer_SequencerDrift(gt *testing.T) {
 			ChainID:   sd.L2Cfg.Config.ChainID,
 			Nonce:     n,
 			GasTipCap: big.NewInt(2 * params.GWei),
-			GasFeeCap: new(big.Int).Add(miner.l1Chain.CurrentBlock().BaseFee(), big.NewInt(2*params.GWei)),
+			GasFeeCap: new(big.Int).Add(miner.l1Chain.CurrentBlock().BaseFee, big.NewInt(2*params.GWei)),
 			Gas:       params.TxGas,
 			To:        &dp.Addresses.Bob,
 			Value:     e2eutils.Ether(2),
@@ -78,7 +77,7 @@ func TestL2Sequencer_SequencerDrift(gt *testing.T) {
 	origin := miner.l1Chain.CurrentBlock()
 
 	// L2 makes blocks to catch up
-	for sequencer.SyncStatus().UnsafeL2.Time+sd.RollupCfg.BlockTime < origin.Time() {
+	for sequencer.SyncStatus().UnsafeL2.Time+sd.RollupCfg.BlockTime < origin.Time {
 		makeL2BlockWithAliceTx()
 		require.Equal(t, uint64(0), sequencer.SyncStatus().UnsafeL2.L1Origin.Number, "no L1 origin change before time matches")
 	}
@@ -91,7 +90,7 @@ func TestL2Sequencer_SequencerDrift(gt *testing.T) {
 	sequencer.ActL1HeadSignal(t)
 
 	// Make blocks up till the sequencer drift is about to surpass, but keep the old L1 origin
-	for sequencer.SyncStatus().UnsafeL2.Time+sd.RollupCfg.BlockTime <= origin.Time()+sd.RollupCfg.MaxSequencerDrift {
+	for sequencer.SyncStatus().UnsafeL2.Time+sd.RollupCfg.BlockTime <= origin.Time+sd.RollupCfg.MaxSequencerDrift {
 		sequencer.ActL2KeepL1Origin(t)
 		makeL2BlockWithAliceTx()
 		require.Equal(t, uint64(1), sequencer.SyncStatus().UnsafeL2.L1Origin.Number, "expected to keep old L1 origin")
@@ -100,7 +99,7 @@ func TestL2Sequencer_SequencerDrift(gt *testing.T) {
 	// We passed the sequencer drift: we can still keep the old origin, but can't include any txs
 	sequencer.ActL2KeepL1Origin(t)
 	sequencer.ActL2StartBlock(t)
-	require.True(t, engine.l2ForceEmpty, "engine should not be allowed to include anything after sequencer drift is surpassed")
+	require.True(t, engine.engineApi.ForcedEmpty(), "engine should not be allowed to include anything after sequencer drift is surpassed")
 }
 
 // TestL2Sequencer_SequencerOnlyReorg regression-tests a Goerli halt where the sequencer
@@ -144,24 +143,19 @@ func TestL2Sequencer_SequencerOnlyReorg(gt *testing.T) {
 	// so it'll keep the L2 block with the old L1 origin, since no conflict is detected.
 	sequencer.ActL1HeadSignal(t)
 	sequencer.ActL2PipelineFull(t)
-	// TODO: CLI-3405 we can detect the inconsistency of the L1 origin of the unsafe L2 head:
-	//  as verifier, there is no need to wait for sequencer to recognize it.
+	// Verifier should detect the inconsistency of the L1 origin and reset the pipeline to follow the reorg
 	newStatus := sequencer.SyncStatus()
-	require.Equal(t, status.HeadL1.Hash, newStatus.UnsafeL2.L1Origin.Hash, "still have old bad L1 origin")
+	require.Zero(t, newStatus.UnsafeL2.L1Origin.Number, "back to genesis block with good L1 origin, drop old unsafe L2 chain with bad L1 origins")
 	require.NotEqual(t, status.HeadL1.Hash, newStatus.HeadL1.Hash, "did see the new L1 head change")
 	require.Equal(t, newStatus.HeadL1.Hash, newStatus.CurrentL1.Hash, "did sync the new L1 head as verifier")
 
 	// the block N+1 cannot build on the old N which still refers to the now orphaned L1 origin
 	require.Equal(t, status.UnsafeL2.L1Origin.Number, newStatus.HeadL1.Number-1, "seeing N+1 to attempt to build on N")
 	require.NotEqual(t, status.UnsafeL2.L1Origin.Hash, newStatus.HeadL1.ParentHash, "but N+1 cannot fit on N")
-	sequencer.ActL1HeadSignal(t)
-	// sequence more L2 blocks, until we actually need the next L1 origin
-	sequencer.ActBuildToL1HeadExclUnsafe(t)
-	// We expect block building to fail when the next L1 block is not consistent with the existing L1 origin
-	sequencer.ActL2StartBlockCheckErr(t, derive.ErrReset)
-	// After hitting a reset error, it reset derivation, and drops the old L1 chain
+
+	// After hitting a reset error, it resets derivation, and drops the old L1 chain
 	sequencer.ActL2PipelineFull(t)
-	require.Zero(t, sequencer.SyncStatus().UnsafeL2.L1Origin.Number, "back to genesis block with good L1 origin, drop old unsafe L2 chain with bad L1 origins")
+
 	// Can build new L2 blocks with good L1 origin
 	sequencer.ActBuildToL1HeadUnsafe(t)
 	require.Equal(t, newStatus.HeadL1.Hash, sequencer.SyncStatus().UnsafeL2.L1Origin.Hash, "build L2 chain with new correct L1 origins")

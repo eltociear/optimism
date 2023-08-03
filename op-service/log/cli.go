@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/term"
 
 	opservice "github.com/ethereum-optimism/optimism/op-service"
@@ -20,22 +20,22 @@ const (
 
 func CLIFlags(envPrefix string) []cli.Flag {
 	return []cli.Flag{
-		cli.StringFlag{
-			Name:   LevelFlagName,
-			Usage:  "The lowest log level that will be output",
-			Value:  "info",
-			EnvVar: opservice.PrefixEnvVar(envPrefix, "LOG_LEVEL"),
+		&cli.StringFlag{
+			Name:    LevelFlagName,
+			Usage:   "The lowest log level that will be output",
+			Value:   "info",
+			EnvVars: opservice.PrefixEnvVar(envPrefix, "LOG_LEVEL"),
 		},
-		cli.StringFlag{
-			Name:   FormatFlagName,
-			Usage:  "Format the log output. Supported formats: 'text', 'json'",
-			Value:  "text",
-			EnvVar: opservice.PrefixEnvVar(envPrefix, "LOG_FORMAT"),
+		&cli.StringFlag{
+			Name:    FormatFlagName,
+			Usage:   "Format the log output. Supported formats: 'text', 'terminal', 'logfmt', 'json', 'json-pretty',",
+			Value:   "text",
+			EnvVars: opservice.PrefixEnvVar(envPrefix, "LOG_FORMAT"),
 		},
-		cli.BoolFlag{
-			Name:   ColorFlagName,
-			Usage:  "Color the log output",
-			EnvVar: opservice.PrefixEnvVar(envPrefix, "LOG_COLOR"),
+		&cli.BoolFlag{
+			Name:    ColorFlagName,
+			Usage:   "Color the log output if in terminal mode",
+			EnvVars: opservice.PrefixEnvVar(envPrefix, "LOG_COLOR"),
 		},
 	}
 }
@@ -43,12 +43,12 @@ func CLIFlags(envPrefix string) []cli.Flag {
 type CLIConfig struct {
 	Level  string // Log level: trace, debug, info, warn, error, crit. Capitals are accepted too.
 	Color  bool   // Color the log output. Defaults to true if terminal is detected.
-	Format string // Format the log output. Supported formats: 'text', 'json'
+	Format string // Format the log output. Supported formats: 'text', 'terminal', 'logfmt', 'json', 'json-pretty'
 }
 
 func (cfg CLIConfig) Check() error {
 	switch cfg.Format {
-	case "json", "json-pretty", "terminal", "text":
+	case "json", "json-pretty", "terminal", "text", "logfmt":
 	default:
 		return fmt.Errorf("unrecognized log format: %s", cfg.Format)
 	}
@@ -65,6 +65,9 @@ func NewLogger(cfg CLIConfig) log.Logger {
 	handler := log.StreamHandler(os.Stdout, Format(cfg.Format, cfg.Color))
 	handler = log.SyncHandler(handler)
 	handler = log.LvlFilterHandler(Level(cfg.Level), handler)
+	// Set the root handle to what we have configured. Some components like go-ethereum's RPC
+	// server use log.Root() instead of being able to pass in a log.
+	log.Root().SetHandler(handler)
 	logger := log.New()
 	logger.SetHandler(handler)
 	return logger
@@ -78,19 +81,13 @@ func DefaultCLIConfig() CLIConfig {
 	}
 }
 
-func ReadLocalCLIConfig(ctx *cli.Context) CLIConfig {
+func ReadCLIConfig(ctx *cli.Context) CLIConfig {
 	cfg := DefaultCLIConfig()
 	cfg.Level = ctx.String(LevelFlagName)
 	cfg.Format = ctx.String(FormatFlagName)
-	cfg.Color = ctx.Bool(ColorFlagName)
-	return cfg
-}
-
-func ReadCLIConfig(ctx *cli.Context) CLIConfig {
-	cfg := DefaultCLIConfig()
-	cfg.Level = ctx.GlobalString(LevelFlagName)
-	cfg.Format = ctx.GlobalString(FormatFlagName)
-	cfg.Color = ctx.GlobalBool(ColorFlagName)
+	if ctx.IsSet(ColorFlagName) {
+		cfg.Color = ctx.Bool(ColorFlagName)
+	}
 	return cfg
 }
 
@@ -101,8 +98,16 @@ func Format(lf string, color bool) log.Format {
 		return log.JSONFormat()
 	case "json-pretty":
 		return log.JSONFormatEx(true, true)
-	case "text", "terminal":
+	case "text":
+		if term.IsTerminal(int(os.Stdout.Fd())) {
+			return log.TerminalFormat(color)
+		} else {
+			return log.LogfmtFormat()
+		}
+	case "terminal":
 		return log.TerminalFormat(color)
+	case "logfmt":
+		return log.LogfmtFormat()
 	default:
 		panic("Failed to create `log.Format` from options")
 	}

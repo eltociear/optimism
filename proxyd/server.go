@@ -2,11 +2,14 @@ package proxyd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -15,14 +18,16 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
-
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/cors"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 const (
@@ -31,7 +36,11 @@ const (
 	ContextKeyXForwardedFor     = "x_forwarded_for"
 	MaxBatchRPCCallsHardLimit   = 100
 	cacheStatusHdr              = "X-Proxyd-Cache-Status"
-	defaultServerTimeout        = time.Second * 10
+	defaultRPCTimeout           = 10 * time.Second
+	defaultBodySizeLimit        = 256 * opt.KiB
+	defaultWSHandshakeTimeout   = 10 * time.Second
+	defaultWSReadTimeout        = 2 * time.Minute
+	defaultWSWriteTimeout       = 10 * time.Second
 	maxRequestBodyLogLen        = 2000
 	defaultMaxUpstreamBatchSize = 10
 )
@@ -39,7 +48,7 @@ const (
 var emptyArrayResponse = json.RawMessage("[]")
 
 type Server struct {
-	backendGroups          map[string]*BackendGroup
+	BackendGroups          map[string]*BackendGroup
 	wsBackendGroup         *BackendGroup
 	wsMethodWhitelist      *StringSet
 	rpcMethodMappings      map[string]string
@@ -54,6 +63,7 @@ type Server struct {
 	mainLim                FrontendRateLimiter
 	overrideLims           map[string]FrontendRateLimiter
 	senderLim              FrontendRateLimiter
+	allowedChainIds        []*big.Int
 	limExemptOrigins       []*regexp.Regexp
 	limExemptUserAgents    []*regexp.Regexp
 	globallyLimitedMethods map[string]bool
@@ -87,11 +97,11 @@ func NewServer(
 	}
 
 	if maxBodySize == 0 {
-		maxBodySize = math.MaxInt64
+		maxBodySize = defaultBodySizeLimit
 	}
 
 	if timeout == 0 {
-		timeout = defaultServerTimeout
+		timeout = defaultRPCTimeout
 	}
 
 	if maxUpstreamBatchSize == 0 {
@@ -152,7 +162,7 @@ func NewServer(
 	}
 
 	return &Server{
-		backendGroups:        backendGroups,
+		BackendGroups:        backendGroups,
 		wsBackendGroup:       wsBackendGroup,
 		wsMethodWhitelist:    wsMethodWhitelist,
 		rpcMethodMappings:    rpcMethodMappings,
@@ -165,12 +175,13 @@ func NewServer(
 		maxRequestBodyLogLen: maxRequestBodyLogLen,
 		maxBatchSize:         maxBatchSize,
 		upgrader: &websocket.Upgrader{
-			HandshakeTimeout: 5 * time.Second,
+			HandshakeTimeout: defaultWSHandshakeTimeout,
 		},
 		mainLim:                mainLim,
 		overrideLims:           overrideLims,
 		globallyLimitedMethods: globalMethodLims,
 		senderLim:              senderLim,
+		allowedChainIds:        senderRateLimitConfig.AllowedChainIds,
 		limExemptOrigins:       limExemptOrigins,
 		limExemptUserAgents:    limExemptUserAgents,
 	}, nil
@@ -221,6 +232,9 @@ func (s *Server) Shutdown() {
 	}
 	if s.wsServer != nil {
 		_ = s.wsServer.Shutdown(context.Background())
+	}
+	for _, bg := range s.BackendGroups {
+		bg.Shutdown()
 	}
 }
 
@@ -340,6 +354,11 @@ func (s *Server) HandleRPC(w http.ResponseWriter, r *http.Request) {
 			writeRPCError(ctx, w, nil, ErrGatewayTimeout)
 			return
 		}
+		if errors.Is(err, ErrConsensusGetReceiptsCantBeBatched) ||
+			errors.Is(err, ErrConsensusGetReceiptsInvalidTarget) {
+			writeRPCError(ctx, w, nil, ErrInvalidRequest(err.Error()))
+			return
+		}
 		if err != nil {
 			writeRPCError(ctx, w, nil, ErrInternal)
 			return
@@ -353,6 +372,11 @@ func (s *Server) HandleRPC(w http.ResponseWriter, r *http.Request) {
 	rawBody := json.RawMessage(body)
 	backendRes, cached, err := s.handleBatchRPC(ctx, []json.RawMessage{rawBody}, isLimited, false)
 	if err != nil {
+		if errors.Is(err, ErrConsensusGetReceiptsCantBeBatched) ||
+			errors.Is(err, ErrConsensusGetReceiptsInvalidTarget) {
+			writeRPCError(ctx, w, nil, ErrInvalidRequest(err.Error()))
+			return
+		}
 		writeRPCError(ctx, w, nil, ErrInternal)
 		return
 	}
@@ -476,8 +500,12 @@ func (s *Server) handleBatchRPC(ctx context.Context, reqs []json.RawMessage, isL
 			start := i * s.maxUpstreamBatchSize
 			end := int(math.Min(float64(start+s.maxUpstreamBatchSize), float64(len(cacheMisses))))
 			elems := cacheMisses[start:end]
-			res, err := s.backendGroups[group.backendGroup].Forward(ctx, createBatchRequest(elems), isBatch)
+			res, err := s.BackendGroups[group.backendGroup].Forward(ctx, createBatchRequest(elems), isBatch)
 			if err != nil {
+				if errors.Is(err, ErrConsensusGetReceiptsCantBeBatched) ||
+					errors.Is(err, ErrConsensusGetReceiptsInvalidTarget) {
+					return nil, false, err
+				}
 				log.Error(
 					"error forwarding RPC batch",
 					"batch_size", len(elems),
@@ -524,6 +552,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		log.Error("error upgrading client conn", "auth", GetAuthCtx(ctx), "req_id", GetReqID(ctx), "err", err)
 		return
 	}
+	clientConn.SetReadLimit(s.maxBodySize)
 
 	proxier, err := s.wsBackendGroup.ProxyWS(ctx, clientConn, s.wsMethodWhitelist)
 	if err != nil {
@@ -559,16 +588,7 @@ func (s *Server) populateContext(w http.ResponseWriter, r *http.Request) context
 	}
 	ctx := context.WithValue(r.Context(), ContextKeyXForwardedFor, xff) // nolint:staticcheck
 
-	if s.authenticatedPaths == nil {
-		// handle the edge case where auth is disabled
-		// but someone sends in an auth key anyway
-		if authorization != "" {
-			log.Info("blocked authenticated request against unauthenticated proxy")
-			httpResponseCodesTotal.WithLabelValues("404").Inc()
-			w.WriteHeader(404)
-			return nil
-		}
-	} else {
+	if len(s.authenticatedPaths) > 0 {
 		if authorization == "" || s.authenticatedPaths[authorization] == "" {
 			log.Info("blocked unauthorized request", "authorization", authorization)
 			httpResponseCodesTotal.WithLabelValues("401").Inc()
@@ -576,7 +596,7 @@ func (s *Server) populateContext(w http.ResponseWriter, r *http.Request) context
 			return nil
 		}
 
-		ctx = context.WithValue(r.Context(), ContextKeyAuth, s.authenticatedPaths[authorization]) // nolint:staticcheck
+		ctx = context.WithValue(ctx, ContextKeyAuth, s.authenticatedPaths[authorization]) // nolint:staticcheck
 	}
 
 	return context.WithValue(
@@ -584,6 +604,14 @@ func (s *Server) populateContext(w http.ResponseWriter, r *http.Request) context
 		ContextKeyReqID, // nolint:staticcheck
 		randStr(10),
 	)
+}
+
+func randStr(l int) string {
+	b := make([]byte, l)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
 }
 
 func (s *Server) isUnlimitedOrigin(origin string) bool {
@@ -636,25 +664,43 @@ func (s *Server) rateLimitSender(ctx context.Context, req *RPCReq) error {
 		return ErrInvalidParams(err.Error())
 	}
 
+	// Check if the transaction is for the expected chain,
+	// otherwise reject before rate limiting to avoid replay attacks.
+	if !s.isAllowedChainId(tx.ChainId()) {
+		log.Debug("chain id is not allowed", "req_id", GetReqID(ctx))
+		return txpool.ErrInvalidSender
+	}
+
 	// Convert the transaction into a Message object so that we can get the
 	// sender. This method performs an ecrecover, which can be expensive.
-	msg, err := tx.AsMessage(types.LatestSignerForChainID(tx.ChainId()), nil)
+	msg, err := core.TransactionToMessage(tx, types.LatestSignerForChainID(tx.ChainId()), nil)
 	if err != nil {
 		log.Debug("could not get message from transaction", "err", err, "req_id", GetReqID(ctx))
 		return ErrInvalidParams(err.Error())
 	}
-
-	ok, err := s.senderLim.Take(ctx, fmt.Sprintf("%s:%d", msg.From().Hex(), tx.Nonce()))
+	ok, err := s.senderLim.Take(ctx, fmt.Sprintf("%s:%d", msg.From.Hex(), tx.Nonce()))
 	if err != nil {
 		log.Error("error taking from sender limiter", "err", err, "req_id", GetReqID(ctx))
 		return ErrInternal
 	}
 	if !ok {
-		log.Debug("sender rate limit exceeded", "sender", msg.From(), "req_id", GetReqID(ctx))
+		log.Debug("sender rate limit exceeded", "sender", msg.From.Hex(), "req_id", GetReqID(ctx))
 		return ErrOverSenderRateLimit
 	}
 
 	return nil
+}
+
+func (s *Server) isAllowedChainId(chainId *big.Int) bool {
+	if s.allowedChainIds == nil || len(s.allowedChainIds) == 0 {
+		return true
+	}
+	for _, id := range s.allowedChainIds {
+		if chainId.Cmp(id) == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func setCacheHeader(w http.ResponseWriter, cached bool) {

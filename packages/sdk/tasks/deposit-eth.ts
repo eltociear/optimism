@@ -4,11 +4,15 @@ import { task, types } from 'hardhat/config'
 import '@nomiclabs/hardhat-ethers'
 import 'hardhat-deploy'
 import { Deployment } from 'hardhat-deploy/types'
-import {
-  predeploys,
-  getContractDefinition,
-} from '@eth-optimism/contracts-bedrock'
+import { predeploys } from '@eth-optimism/core-utils'
 import { providers, utils, ethers } from 'ethers'
+import Artifact__L2ToL1MessagePasser from '@eth-optimism/contracts-bedrock/forge-artifacts/L2ToL1MessagePasser.sol/L2ToL1MessagePasser.json'
+import Artifact__L2CrossDomainMessenger from '@eth-optimism/contracts-bedrock/forge-artifacts/L2CrossDomainMessenger.sol/L2CrossDomainMessenger.json'
+import Artifact__L2StandardBridge from '@eth-optimism/contracts-bedrock/forge-artifacts/L2StandardBridge.sol/L2StandardBridge.json'
+import Artifact__OptimismPortal from '@eth-optimism/contracts-bedrock/forge-artifacts/OptimismPortal.sol/OptimismPortal.json'
+import Artifact__L1CrossDomainMessenger from '@eth-optimism/contracts-bedrock/forge-artifacts/L1CrossDomainMessenger.sol/L1CrossDomainMessenger.json'
+import Artifact__L1StandardBridge from '@eth-optimism/contracts-bedrock/forge-artifacts/L1StandardBridge.sol/L1StandardBridge.json'
+import Artifact__L2OutputOracle from '@eth-optimism/contracts-bedrock/forge-artifacts/L2OutputOracle.sol/L2OutputOracle.json'
 
 import {
   CrossChainMessenger,
@@ -25,12 +29,6 @@ task('deposit-eth', 'Deposits ether to L2.')
     'l2ProviderUrl',
     'L2 provider URL.',
     'http://localhost:9545',
-    types.string
-  )
-  .addParam(
-    'opNodeProviderUrl',
-    'op-node provider URL',
-    'http://localhost:7545',
     types.string
   )
   .addOptionalParam('to', 'Recipient of the ether', '', types.string)
@@ -91,8 +89,18 @@ task('deposit-eth', 'Deposits ether to L2.')
     let contractAddrs = CONTRACT_ADDRESSES[l2ChainId]
     if (args.l1ContractsJsonPath) {
       const data = await fs.readFile(args.l1ContractsJsonPath)
+      const json = JSON.parse(data.toString())
       contractAddrs = {
-        l1: JSON.parse(data.toString()),
+        l1: {
+          AddressManager: json.AddressManager,
+          L1CrossDomainMessenger: json.L1CrossDomainMessengerProxy,
+          L1StandardBridge: json.L1StandardBridgeProxy,
+          StateCommitmentChain: ethers.constants.AddressZero,
+          CanonicalTransactionChain: ethers.constants.AddressZero,
+          BondManager: ethers.constants.AddressZero,
+          OptimismPortal: json.OptimismPortalProxy,
+          L2OutputOracle: json.L2OutputOracleProxy,
+        },
         l2: DEFAULT_L2_CONTRACT_ADDRESSES,
       } as OEContractsLike
     } else if (!contractAddrs) {
@@ -136,8 +144,8 @@ task('deposit-eth', 'Deposits ether to L2.')
       contractAddrs = {
         l1: {
           AddressManager: Deployment__AddressManager.address,
-          L1CrossDomainMessenger: Deployment__L1CrossDomainMessenger,
-          L1StandardBridge: Deployment__L1StandardBridge,
+          L1CrossDomainMessenger: Deployment__L1CrossDomainMessenger.address,
+          L1StandardBridge: Deployment__L1StandardBridge.address,
           StateCommitmentChain: ethers.constants.AddressZero,
           CanonicalTransactionChain: ethers.constants.AddressZero,
           BondManager: ethers.constants.AddressZero,
@@ -148,45 +156,33 @@ task('deposit-eth', 'Deposits ether to L2.')
       }
     }
 
-    const Artifact__L2ToL1MessagePasser = await getContractDefinition(
-      'L2ToL1MessagePasser'
-    )
-
-    const Artifact__L2CrossDomainMessenger = await getContractDefinition(
-      'L2CrossDomainMessenger'
-    )
-
-    const Artifact__L2StandardBridge = await getContractDefinition(
-      'L2StandardBridge'
-    )
-
-    const Artifact__OptimismPortal = await getContractDefinition(
-      'OptimismPortal'
-    )
-
-    const Artifact__L1CrossDomainMessenger = await getContractDefinition(
-      'L1CrossDomainMessenger'
-    )
-
-    const Artifact__L1StandardBridge = await getContractDefinition(
-      'L1StandardBridge'
-    )
-
+    console.log(`OptimismPortal: ${contractAddrs.l1.OptimismPortal}`)
     const OptimismPortal = new hre.ethers.Contract(
       contractAddrs.l1.OptimismPortal,
       Artifact__OptimismPortal.abi,
       signer
     )
 
+    console.log(
+      `L1CrossDomainMessenger: ${contractAddrs.l1.L1CrossDomainMessenger}`
+    )
     const L1CrossDomainMessenger = new hre.ethers.Contract(
       contractAddrs.l1.L1CrossDomainMessenger,
       Artifact__L1CrossDomainMessenger.abi,
       signer
     )
 
+    console.log(`L1StandardBridge: ${contractAddrs.l1.L1StandardBridge}`)
     const L1StandardBridge = new hre.ethers.Contract(
       contractAddrs.l1.L1StandardBridge,
       Artifact__L1StandardBridge.abi,
+      signer
+    )
+
+    console.log(`L2OutputOracle: ${contractAddrs.l1.L2OutputOracle}`)
+    const L2OutputOracle = new hre.ethers.Contract(
+      contractAddrs.l1.L2OutputOracle,
+      Artifact__L2OutputOracle.abi,
       signer
     )
 
@@ -214,11 +210,11 @@ task('deposit-eth', 'Deposits ether to L2.')
       contracts: contractAddrs,
     })
 
-    const opBalanceBefore = await signer.provider.getBalance(
+    const opBalanceBefore = await signer!.provider!.getBalance(
       OptimismPortal.address
     )
 
-    const l1BridgeBalanceBefore = await signer.provider.getBalance(
+    const l1BridgeBalanceBefore = await signer!.provider!.getBalance(
       L1StandardBridge.address
     )
 
@@ -237,11 +233,11 @@ task('deposit-eth', 'Deposits ether to L2.')
       `Deposit complete - included in block ${depositMessageReceipt.transactionReceipt.blockNumber}`
     )
 
-    const opBalanceAfter = await signer.provider.getBalance(
+    const opBalanceAfter = await signer!.provider!.getBalance(
       OptimismPortal.address
     )
 
-    const l1BridgeBalanceAfter = await signer.provider.getBalance(
+    const l1BridgeBalanceAfter = await signer!.provider!.getBalance(
       L1StandardBridge.address
     )
 
@@ -318,6 +314,12 @@ task('deposit-eth', 'Deposits ether to L2.')
     const proveInterval = setInterval(async () => {
       const currentStatus = await messenger.getMessageStatus(ethWithdrawReceipt)
       console.log(`Message status: ${MessageStatus[currentStatus]}`)
+      const latest = await L2OutputOracle.latestBlockNumber()
+      console.log(
+        `Latest L2OutputOracle commitment number: ${latest.toString()}`
+      )
+      const tip = await signer.provider!.getBlockNumber()
+      console.log(`L1 chain tip: ${tip.toString()}`)
     }, 3000)
 
     try {
@@ -421,7 +423,7 @@ task('deposit-eth', 'Deposits ether to L2.')
       }
     }
 
-    const opBalanceFinally = await signer.provider.getBalance(
+    const opBalanceFinally = await signer!.provider!.getBalance(
       OptimismPortal.address
     )
 

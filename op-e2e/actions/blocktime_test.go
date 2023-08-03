@@ -21,6 +21,8 @@ func TestBatchInLastPossibleBlocks(gt *testing.T) {
 	t := NewDefaultTesting(gt)
 	dp := e2eutils.MakeDeployParams(t, defaultRollupTestParams)
 	dp.DeployConfig.SequencerWindowSize = 4
+	dp.DeployConfig.L2BlockTime = 2
+
 	sd := e2eutils.Setup(t, dp, defaultAlloc)
 	log := testlog.Logger(t, log.LvlDebug)
 
@@ -28,19 +30,19 @@ func TestBatchInLastPossibleBlocks(gt *testing.T) {
 
 	signer := types.LatestSigner(sd.L2Cfg.Config)
 	cl := sequencerEngine.EthClient()
+	aliceNonce := uint64(0) // manual nonce management to avoid geth pending-tx nonce non-determinism flakiness
 	aliceTx := func() {
-		n, err := cl.PendingNonceAt(t.Ctx(), dp.Addresses.Alice)
-		require.NoError(t, err)
 		tx := types.MustSignNewTx(dp.Secrets.Alice, signer, &types.DynamicFeeTx{
 			ChainID:   sd.L2Cfg.Config.ChainID,
-			Nonce:     n,
+			Nonce:     aliceNonce,
 			GasTipCap: big.NewInt(2 * params.GWei),
-			GasFeeCap: new(big.Int).Add(miner.l1Chain.CurrentBlock().BaseFee(), big.NewInt(2*params.GWei)),
+			GasFeeCap: new(big.Int).Add(miner.l1Chain.CurrentBlock().BaseFee, big.NewInt(2*params.GWei)),
 			Gas:       params.TxGas,
 			To:        &dp.Addresses.Bob,
 			Value:     e2eutils.Ether(2),
 		})
 		require.NoError(gt, cl.SendTransaction(t.Ctx(), tx))
+		aliceNonce += 1
 	}
 	makeL2BlockWithAliceTx := func() {
 		aliceTx()
@@ -77,7 +79,7 @@ func TestBatchInLastPossibleBlocks(gt *testing.T) {
 	}
 
 	// 8 L1 blocks with 17 L2 blocks is the unsafe state.
-	// Because wew consistently batch submitted we are one epoch behind the unsafe head with the safe head
+	// Because we consistently batch submitted we are one epoch behind the unsafe head with the safe head
 	verifyChainStateOnSequencer(8, 17, 8, 15, 7)
 
 	// Create the batch for L2 blocks 16 & 17
@@ -139,19 +141,19 @@ func TestLargeL1Gaps(gt *testing.T) {
 
 	signer := types.LatestSigner(sd.L2Cfg.Config)
 	cl := sequencerEngine.EthClient()
+	aliceNonce := uint64(0) // manual nonce, avoid pending-tx nonce management, that causes flakes
 	aliceTx := func() {
-		n, err := cl.PendingNonceAt(t.Ctx(), dp.Addresses.Alice)
-		require.NoError(t, err)
 		tx := types.MustSignNewTx(dp.Secrets.Alice, signer, &types.DynamicFeeTx{
 			ChainID:   sd.L2Cfg.Config.ChainID,
-			Nonce:     n,
+			Nonce:     aliceNonce,
 			GasTipCap: big.NewInt(2 * params.GWei),
-			GasFeeCap: new(big.Int).Add(miner.l1Chain.CurrentBlock().BaseFee(), big.NewInt(2*params.GWei)),
+			GasFeeCap: new(big.Int).Add(miner.l1Chain.CurrentBlock().BaseFee, big.NewInt(2*params.GWei)),
 			Gas:       params.TxGas,
 			To:        &dp.Addresses.Bob,
 			Value:     e2eutils.Ether(2),
 		})
 		require.NoError(gt, cl.SendTransaction(t.Ctx(), tx))
+		aliceNonce += 1
 	}
 	makeL2BlockWithAliceTx := func() {
 		aliceTx()

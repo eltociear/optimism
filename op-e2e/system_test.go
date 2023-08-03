@@ -2,10 +2,8 @@ package op_e2e
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"math/big"
-	"os"
 	"testing"
 	"time"
 
@@ -13,57 +11,36 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/ethclient/gethclient"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/slices"
 
 	"github.com/ethereum-optimism/optimism/op-bindings/bindings"
 	"github.com/ethereum-optimism/optimism/op-bindings/predeploys"
 	"github.com/ethereum-optimism/optimism/op-node/client"
 	"github.com/ethereum-optimism/optimism/op-node/eth"
+	"github.com/ethereum-optimism/optimism/op-node/metrics"
+	rollupNode "github.com/ethereum-optimism/optimism/op-node/node"
+	"github.com/ethereum-optimism/optimism/op-node/p2p"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
+	"github.com/ethereum-optimism/optimism/op-node/rollup/driver"
 	"github.com/ethereum-optimism/optimism/op-node/sources"
 	"github.com/ethereum-optimism/optimism/op-node/testlog"
-	"github.com/ethereum-optimism/optimism/op-node/withdrawals"
+	"github.com/ethereum-optimism/optimism/op-service/backoff"
+	oppprof "github.com/ethereum-optimism/optimism/op-service/pprof"
 )
 
-var enableParallelTesting bool = true
-
-// Init testing to enable test flags
-var _ = func() bool {
-	testing.Init()
-	return true
-}()
-
-var verboseGethNodes bool
-
-func init() {
-	flag.BoolVar(&verboseGethNodes, "gethlogs", true, "Enable logs on geth nodes")
-	flag.Parse()
-	if os.Getenv("OP_E2E_DISABLE_PARALLEL") == "true" {
-		enableParallelTesting = false
-	}
-}
-
-func parallel(t *testing.T) {
-	t.Helper()
-	if enableParallelTesting {
-		t.Parallel()
-	}
-}
-
 func TestL2OutputSubmitter(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
 	cfg.NonFinalizedProposals = true // speed up the time till we see output proposals
@@ -79,7 +56,7 @@ func TestL2OutputSubmitter(t *testing.T) {
 	rollupClient := sources.NewRollupClient(client.NewBaseRPCClient(rollupRPCClient))
 
 	//  OutputOracle is already deployed
-	l2OutputOracle, err := bindings.NewL2OutputOracleCaller(predeploys.DevL2OutputOracleAddr, l1Client)
+	l2OutputOracle, err := bindings.NewL2OutputOracleCaller(cfg.L1Deployments.L2OutputOracleProxy, l1Client)
 	require.Nil(t, err)
 
 	initialOutputBlockNumber, err := l2OutputOracle.LatestBlockNumber(&bind.CallOpts{})
@@ -134,10 +111,7 @@ func TestL2OutputSubmitter(t *testing.T) {
 // TestSystemE2E sets up a L1 Geth node, a rollup node, and a L2 geth node and then confirms that L1 deposits are reflected on L2.
 // All nodes are run in process (but are the full nodes, not mocked or stubbed).
 func TestSystemE2E(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
 
@@ -158,37 +132,20 @@ func TestSystemE2E(t *testing.T) {
 	// Send Transaction & wait for success
 	fromAddr := sys.cfg.Secrets.Addresses().Alice
 
-	// Find deposit contract
-	depositContract, err := bindings.NewOptimismPortal(predeploys.DevOptimismPortalAddr, l1Client)
-	require.Nil(t, err)
-
-	// Create signer
-	opts, err := bind.NewKeyedTransactorWithChainID(ethPrivKey, cfg.L1ChainIDBig())
-	require.Nil(t, err)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	startBalance, err := l2Verif.BalanceAt(ctx, fromAddr, nil)
 	require.Nil(t, err)
 
-	// Finally send TX
+	// Send deposit transaction
+	opts, err := bind.NewKeyedTransactorWithChainID(ethPrivKey, cfg.L1ChainIDBig())
+	require.Nil(t, err)
 	mintAmount := big.NewInt(1_000_000_000_000)
 	opts.Value = mintAmount
-	tx, err := depositContract.DepositTransaction(opts, fromAddr, common.Big0, 1_000_000, false, nil)
-	require.Nil(t, err, "with deposit tx")
-
-	receipt, err := waitForTransaction(tx.Hash(), l1Client, 3*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for deposit tx on L1")
-
-	reconstructedDep, err := derive.UnmarshalDepositLogEvent(receipt.Logs[0])
-	require.NoError(t, err, "Could not reconstruct L2 Deposit")
-	tx = types.NewTx(reconstructedDep)
-	receipt, err = waitForTransaction(tx.Hash(), l2Verif, 6*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.NoError(t, err)
-	require.Equal(t, receipt.Status, types.ReceiptStatusSuccessful)
+	SendDepositTx(t, cfg, l1Client, l2Verif, opts, func(l2Opts *DepositTxOpts) {})
 
 	// Confirm balance
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	endBalance, err := l2Verif.BalanceAt(ctx, fromAddr, nil)
 	require.Nil(t, err)
@@ -198,25 +155,12 @@ func TestSystemE2E(t *testing.T) {
 	require.Equal(t, mintAmount, diff, "Did not get expected balance change")
 
 	// Submit TX to L2 sequencer node
-	toAddr := common.Address{0xff, 0xff}
-	tx = types.MustSignNewTx(ethPrivKey, types.LatestSignerForChainID(cfg.L2ChainIDBig()), &types.DynamicFeeTx{
-		ChainID:   cfg.L2ChainIDBig(),
-		Nonce:     1, // Already have deposit
-		To:        &toAddr,
-		Value:     big.NewInt(1_000_000_000),
-		GasTipCap: big.NewInt(10),
-		GasFeeCap: big.NewInt(200),
-		Gas:       21000,
+	receipt := SendL2Tx(t, cfg, l2Seq, ethPrivKey, func(opts *TxOpts) {
+		opts.Value = big.NewInt(1_000_000_000)
+		opts.Nonce = 1 // Already have deposit
+		opts.ToAddr = &common.Address{0xff, 0xff}
+		opts.VerifyOnClients(l2Verif)
 	})
-	err = l2Seq.SendTransaction(context.Background(), tx)
-	require.Nil(t, err, "Sending L2 tx to sequencer")
-
-	_, err = waitForTransaction(tx.Hash(), l2Seq, 3*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for L2 tx on sequencer")
-
-	receipt, err = waitForTransaction(tx.Hash(), l2Verif, 10*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for L2 tx on verifier")
-	require.Equal(t, types.ReceiptStatusSuccessful, receipt.Status, "TX should have succeeded")
 
 	// Verify blocks match after batch submission on verifiers and sequencers
 	verifBlock, err := l2Verif.BlockByNumber(context.Background(), receipt.BlockNumber)
@@ -242,10 +186,7 @@ func TestSystemE2E(t *testing.T) {
 
 // TestConfirmationDepth runs the rollup with both sequencer and verifier not immediately processing the tip of the chain.
 func TestConfirmationDepth(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
 	cfg.DeployConfig.SequencerWindowSize = 4
@@ -293,24 +234,23 @@ func TestConfirmationDepth(t *testing.T) {
 // TestPendingGasLimit tests the configuration of the gas limit of the pending block,
 // and if it does not conflict with the regular gas limit on the verifier or sequencer.
 func TestPendingGasLimit(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
 
 	// configure the L2 gas limit to be high, and the pending gas limits to be lower for resource saving.
-	cfg.DeployConfig.L2GenesisBlockGasLimit = 20_000_000
+	cfg.DeployConfig.L2GenesisBlockGasLimit = 30_000_000
 	cfg.GethOptions["sequencer"] = []GethOption{
 		func(ethCfg *ethconfig.Config, nodeCfg *node.Config) error {
 			ethCfg.Miner.GasCeil = 10_000_000
+			ethCfg.Miner.RollupComputePendingBlock = true
 			return nil
 		},
 	}
 	cfg.GethOptions["verifier"] = []GethOption{
 		func(ethCfg *ethconfig.Config, nodeCfg *node.Config) error {
 			ethCfg.Miner.GasCeil = 9_000_000
+			ethCfg.Miner.RollupComputePendingBlock = true
 			return nil
 		},
 	}
@@ -339,8 +279,8 @@ func TestPendingGasLimit(t *testing.T) {
 	for {
 		checkGasLimit(l2Seq, big.NewInt(-1), 10_000_000)
 		checkGasLimit(l2Verif, big.NewInt(-1), 9_000_000)
-		checkGasLimit(l2Seq, nil, 20_000_000)
-		latestVerifHeader := checkGasLimit(l2Verif, nil, 20_000_000)
+		checkGasLimit(l2Seq, nil, 30_000_000)
+		latestVerifHeader := checkGasLimit(l2Verif, nil, 30_000_000)
 
 		// Stop once the verifier passes genesis:
 		// this implies we checked a new block from the sequencer, on both sequencer and verifier nodes.
@@ -353,10 +293,7 @@ func TestPendingGasLimit(t *testing.T) {
 
 // TestFinalize tests if L2 finalizes after sufficient time after L1 finalizes
 func TestFinalize(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
 
@@ -367,9 +304,9 @@ func TestFinalize(t *testing.T) {
 	l2Seq := sys.Clients["sequencer"]
 
 	// as configured in the extra geth lifecycle in testing setup
-	finalizedDistance := uint64(8)
+	const finalizedDistance = 8
 	// Wait enough time for L1 to finalize and L2 to confirm its data in finalized L1 blocks
-	<-time.After(time.Duration((finalizedDistance+4)*cfg.DeployConfig.L1BlockTime) * time.Second)
+	time.Sleep(time.Duration((finalizedDistance+6)*cfg.DeployConfig.L1BlockTime) * time.Second)
 
 	// fetch the finalizes head of geth
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -381,10 +318,7 @@ func TestFinalize(t *testing.T) {
 }
 
 func TestMintOnRevertedDeposit(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 	cfg := DefaultSystemConfig(t)
 
 	sys, err := cfg.Start()
@@ -394,9 +328,6 @@ func TestMintOnRevertedDeposit(t *testing.T) {
 	l1Client := sys.Clients["l1"]
 	l2Verif := sys.Clients["verifier"]
 
-	// Find deposit contract
-	depositContract, err := bindings.NewOptimismPortal(predeploys.DevOptimismPortalAddr, l1Client)
-	require.Nil(t, err)
 	l1Node := sys.Nodes["l1"]
 
 	// create signer
@@ -418,19 +349,12 @@ func TestMintOnRevertedDeposit(t *testing.T) {
 	toAddr := common.Address{0xff, 0xff}
 	mintAmount := big.NewInt(9_000_000)
 	opts.Value = mintAmount
-	value := new(big.Int).Mul(common.Big2, startBalance) // trigger a revert by transferring more than we have available
-	tx, err := depositContract.DepositTransaction(opts, toAddr, value, 1_000_000, false, nil)
-	require.Nil(t, err, "with deposit tx")
-
-	receipt, err := waitForTransaction(tx.Hash(), l1Client, 3*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for deposit tx on L1")
-
-	reconstructedDep, err := derive.UnmarshalDepositLogEvent(receipt.Logs[0])
-	require.NoError(t, err, "Could not reconstruct L2 Deposit")
-	tx = types.NewTx(reconstructedDep)
-	receipt, err = waitForTransaction(tx.Hash(), l2Verif, 10*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.NoError(t, err)
-	require.Equal(t, receipt.Status, types.ReceiptStatusFailed)
+	SendDepositTx(t, cfg, l1Client, l2Verif, opts, func(l2Opts *DepositTxOpts) {
+		l2Opts.ToAddr = toAddr
+		// trigger a revert by transferring more than we have available
+		l2Opts.Value = new(big.Int).Mul(common.Big2, startBalance)
+		l2Opts.ExpectedStatus = types.ReceiptStatusFailed
+	})
 
 	// Confirm balance
 	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
@@ -455,10 +379,7 @@ func TestMintOnRevertedDeposit(t *testing.T) {
 }
 
 func TestMissingBatchE2E(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 	// Note this test zeroes the balance of the batch-submitter to make the batches unable to go into L1.
 	// The test logs may look scary, but this is expected:
 	// 'batcher unable to publish transaction    role=batcher   err="insufficient funds for gas * price + value"'
@@ -476,27 +397,18 @@ func TestMissingBatchE2E(t *testing.T) {
 
 	l2Seq := sys.Clients["sequencer"]
 	l2Verif := sys.Clients["verifier"]
+	seqRollupRPCClient, err := rpc.DialContext(context.Background(), sys.RollupNodes["sequencer"].HTTPEndpoint())
+	require.Nil(t, err)
+	seqRollupClient := sources.NewRollupClient(client.NewBaseRPCClient(seqRollupRPCClient))
 
 	// Transactor Account
 	ethPrivKey := cfg.Secrets.Alice
 
 	// Submit TX to L2 sequencer node
-	toAddr := common.Address{0xff, 0xff}
-	tx := types.MustSignNewTx(ethPrivKey, types.LatestSignerForChainID(cfg.L2ChainIDBig()), &types.DynamicFeeTx{
-		ChainID:   cfg.L2ChainIDBig(),
-		Nonce:     0,
-		To:        &toAddr,
-		Value:     big.NewInt(1_000_000_000),
-		GasTipCap: big.NewInt(10),
-		GasFeeCap: big.NewInt(200),
-		Gas:       21000,
+	receipt := SendL2Tx(t, cfg, l2Seq, ethPrivKey, func(opts *TxOpts) {
+		opts.ToAddr = &common.Address{0xff, 0xff}
+		opts.Value = big.NewInt(1_000_000_000)
 	})
-	err = l2Seq.SendTransaction(context.Background(), tx)
-	require.Nil(t, err, "Sending L2 tx to sequencer")
-
-	// Let it show up on the unsafe chain
-	receipt, err := waitForTransaction(tx.Hash(), l2Seq, 3*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for L2 tx on sequencer")
 
 	// Wait until the block it was first included in shows up in the safe chain on the verifier
 	_, err = waitForBlock(receipt.BlockNumber, l2Verif, time.Duration((sys.RollupConfig.SeqWindowSize+4)*cfg.DeployConfig.L1BlockTime)*time.Second)
@@ -505,12 +417,12 @@ func TestMissingBatchE2E(t *testing.T) {
 	// Assert that the transaction is not found on the verifier
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, err = l2Verif.TransactionReceipt(ctx, tx.Hash())
+	_, err = l2Verif.TransactionReceipt(ctx, receipt.TxHash)
 	require.Equal(t, ethereum.NotFound, err, "Found transaction in verifier when it should not have been included")
 
 	// Wait a short time for the L2 reorg to occur on the sequencer as well.
-	// The proper thing to do is to wait until the sequencer marks this block safe.
-	<-time.After(2 * time.Second)
+	err = waitForSafeHead(ctx, receipt.BlockNumber.Uint64(), seqRollupClient)
+	require.Nil(t, err, "timeout waiting for L2 reorg on sequencer safe head")
 
 	// Assert that the reconciliation process did an L2 reorg on the sequencer to remove the invalid block
 	ctx2, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -578,19 +490,20 @@ func L1InfoFromState(ctx context.Context, contract *bindings.L1Block, l2Number *
 // TestSystemMockP2P sets up a L1 Geth node, a rollup node, and a L2 geth node and then confirms that
 // the nodes can sync L2 blocks before they are confirmed on L1.
 func TestSystemMockP2P(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	t.Skip("flaky in CI") // TODO(CLI-3859): Re-enable this test.
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
-	// slow down L1 blocks so we can see the L2 blocks arrive well before the L1 blocks do.
-	// Keep the seq window small so the L2 chain is started quick
-	cfg.DeployConfig.L1BlockTime = 10
+	// Disable batcher, so we don't sync from L1 & set a large sequence window so we only have unsafe blocks
+	cfg.DisableBatcher = true
+	cfg.DeployConfig.SequencerWindowSize = 100_000
+	cfg.DeployConfig.MaxSequencerDrift = 100_000
+	// disable at the start, so we don't miss any gossiped blocks.
+	cfg.Nodes["sequencer"].Driver.SequencerStopped = true
 
 	// connect the nodes
 	cfg.P2PTopology = map[string][]string{
-		"verifier": []string{"sequencer"},
+		"verifier": {"sequencer"},
 	}
 
 	var published, received []common.Hash
@@ -608,6 +521,29 @@ func TestSystemMockP2P(t *testing.T) {
 	require.Nil(t, err, "Error starting up system")
 	defer sys.Close()
 
+	// Enable the sequencer now that everyone is ready to receive payloads.
+	rollupRPCClient, err := rpc.DialContext(context.Background(), sys.RollupNodes["sequencer"].HTTPEndpoint())
+	require.Nil(t, err)
+
+	verifierPeerID := sys.RollupNodes["verifier"].P2P().Host().ID()
+	check := func() bool {
+		sequencerBlocksTopicPeers := sys.RollupNodes["sequencer"].P2P().GossipOut().BlocksTopicPeers()
+		return slices.Contains[peer.ID](sequencerBlocksTopicPeers, verifierPeerID)
+	}
+
+	// poll to see if the verifier node is connected & meshed on gossip.
+	// Without this verifier, we shouldn't start sending blocks around, or we'll miss them and fail the test.
+	backOffStrategy := backoff.Exponential()
+	for i := 0; i < 10; i++ {
+		if check() {
+			break
+		}
+		time.Sleep(backOffStrategy.Duration(i))
+	}
+	require.True(t, check(), "verifier must be meshed with sequencer for gossip test to proceed")
+
+	require.NoError(t, rollupRPCClient.Call(nil, "admin_startSequencer", sys.L2GenesisCfg.ToBlock().Hash()))
+
 	l2Seq := sys.Clients["sequencer"]
 	l2Verif := sys.Clients["verifier"]
 
@@ -615,42 +551,334 @@ func TestSystemMockP2P(t *testing.T) {
 	ethPrivKey := cfg.Secrets.Alice
 
 	// Submit TX to L2 sequencer node
-	toAddr := common.Address{0xff, 0xff}
-	tx := types.MustSignNewTx(ethPrivKey, types.LatestSignerForChainID(cfg.L2ChainIDBig()), &types.DynamicFeeTx{
-		ChainID:   cfg.L2ChainIDBig(),
-		Nonce:     0,
-		To:        &toAddr,
-		Value:     big.NewInt(1_000_000_000),
-		GasTipCap: big.NewInt(10),
-		GasFeeCap: big.NewInt(200),
-		Gas:       21000,
+	receiptSeq := SendL2Tx(t, cfg, l2Seq, ethPrivKey, func(opts *TxOpts) {
+		opts.ToAddr = &common.Address{0xff, 0xff}
+		opts.Value = big.NewInt(1_000_000_000)
+
+		// Wait until the block it was first included in shows up in the safe chain on the verifier
+		opts.VerifyOnClients(l2Verif)
 	})
-	err = l2Seq.SendTransaction(context.Background(), tx)
-	require.Nil(t, err, "Sending L2 tx to sequencer")
-
-	// Wait for tx to be mined on the L2 sequencer chain
-	receiptSeq, err := waitForTransaction(tx.Hash(), l2Seq, 6*time.Duration(sys.RollupConfig.BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for L2 tx on sequencer")
-
-	// Wait until the block it was first included in shows up in the safe chain on the verifier
-	receiptVerif, err := waitForTransaction(tx.Hash(), l2Verif, 6*time.Duration(sys.RollupConfig.BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for L2 tx on verifier")
-
-	require.Equal(t, receiptSeq, receiptVerif)
 
 	// Verify that everything that was received was published
 	require.GreaterOrEqual(t, len(published), len(received))
 	require.ElementsMatch(t, received, published[:len(received)])
 
 	// Verify that the tx was received via p2p
-	require.Contains(t, received, receiptVerif.BlockHash)
+	require.Contains(t, received, receiptSeq.BlockHash)
+}
+
+// TestSystemRPCAltSync sets up a L1 Geth node, a rollup node, and a L2 geth node and then confirms that
+// the nodes can sync L2 blocks before they are confirmed on L1.
+//
+// Test steps:
+// 1. Spin up the nodes (P2P is disabled on the verifier)
+// 2. Send a transaction to the sequencer.
+// 3. Wait for the TX to be mined on the sequencer chain.
+// 5. Wait for the verifier to detect a gap in the payload queue vs. the unsafe head
+// 6. Wait for the RPC sync method to grab the block from the sequencer over RPC and insert it into the verifier's unsafe chain.
+// 7. Wait for the verifier to sync the unsafe chain into the safe chain.
+// 8. Verify that the TX is included in the verifier's safe chain.
+func TestSystemRPCAltSync(t *testing.T) {
+	InitParallel(t)
+
+	cfg := DefaultSystemConfig(t)
+	// the default is nil, but this may change in the future.
+	// This test must ensure the blocks are not synced via Gossip, but instead via the alt RPC based sync.
+	cfg.P2PTopology = nil
+	// Disable batcher, so there will not be any L1 data to sync from
+	cfg.DisableBatcher = true
+
+	var published, received []string
+	seqTracer, verifTracer := new(FnTracer), new(FnTracer)
+	// The sequencer still publishes the blocks to the tracer, even if they do not reach the network due to disabled P2P
+	seqTracer.OnPublishL2PayloadFn = func(ctx context.Context, payload *eth.ExecutionPayload) {
+		published = append(published, payload.ID().String())
+	}
+	// Blocks are now received via the RPC based alt-sync method
+	verifTracer.OnUnsafeL2PayloadFn = func(ctx context.Context, from peer.ID, payload *eth.ExecutionPayload) {
+		received = append(received, payload.ID().String())
+	}
+	cfg.Nodes["sequencer"].Tracer = seqTracer
+	cfg.Nodes["verifier"].Tracer = verifTracer
+
+	sys, err := cfg.Start(SystemConfigOption{
+		key:  "afterRollupNodeStart",
+		role: "sequencer",
+		action: func(sCfg *SystemConfig, system *System) {
+			rpc, _ := system.Nodes["sequencer"].Attach() // never errors
+			cfg.Nodes["verifier"].L2Sync = &rollupNode.PreparedL2SyncEndpoint{
+				Client: client.NewBaseRPCClient(rpc),
+			}
+		},
+	})
+	require.Nil(t, err, "Error starting up system")
+	defer sys.Close()
+
+	l2Seq := sys.Clients["sequencer"]
+	l2Verif := sys.Clients["verifier"]
+
+	// Transactor Account
+	ethPrivKey := cfg.Secrets.Alice
+
+	// Submit a TX to L2 sequencer node
+	receiptSeq := SendL2Tx(t, cfg, l2Seq, ethPrivKey, func(opts *TxOpts) {
+		opts.ToAddr = &common.Address{0xff, 0xff}
+		opts.Value = big.NewInt(1_000_000_000)
+
+		// Wait for alt RPC sync to pick up the blocks on the sequencer chain
+		opts.VerifyOnClients(l2Verif)
+	})
+
+	// Verify that the tx was received via RPC sync (P2P is disabled)
+	require.Contains(t, received, eth.BlockID{Hash: receiptSeq.BlockHash, Number: receiptSeq.BlockNumber.Uint64()}.String())
+
+	// Verify that everything that was received was published
+	require.GreaterOrEqual(t, len(published), len(received))
+	require.ElementsMatch(t, received, published[:len(received)])
+}
+
+func TestSystemP2PAltSync(t *testing.T) {
+	InitParallel(t)
+
+	cfg := DefaultSystemConfig(t)
+
+	// remove default verifier node
+	delete(cfg.Nodes, "verifier")
+	// Add more verifier nodes
+	cfg.Nodes["alice"] = &rollupNode.Config{
+		Driver: driver.Config{
+			VerifierConfDepth:  0,
+			SequencerConfDepth: 0,
+			SequencerEnabled:   false,
+		},
+		L1EpochPollInterval: time.Second * 4,
+	}
+	cfg.Nodes["bob"] = &rollupNode.Config{
+		Driver: driver.Config{
+			VerifierConfDepth:  0,
+			SequencerConfDepth: 0,
+			SequencerEnabled:   false,
+		},
+		L1EpochPollInterval: time.Second * 4,
+	}
+	cfg.Loggers["alice"] = testlog.Logger(t, log.LvlInfo).New("role", "alice")
+	cfg.Loggers["bob"] = testlog.Logger(t, log.LvlInfo).New("role", "bob")
+
+	// connect the nodes
+	cfg.P2PTopology = map[string][]string{
+		"sequencer": {"alice", "bob"},
+		"alice":     {"sequencer", "bob"},
+		"bob":       {"alice", "sequencer"},
+	}
+	// Enable the P2P req-resp based sync
+	cfg.P2PReqRespSync = true
+
+	// Disable batcher, so there will not be any L1 data to sync from
+	cfg.DisableBatcher = true
+
+	var published []string
+	seqTracer := new(FnTracer)
+	// The sequencer still publishes the blocks to the tracer, even if they do not reach the network due to disabled P2P
+	seqTracer.OnPublishL2PayloadFn = func(ctx context.Context, payload *eth.ExecutionPayload) {
+		published = append(published, payload.ID().String())
+	}
+	// Blocks are now received via the RPC based alt-sync method
+	cfg.Nodes["sequencer"].Tracer = seqTracer
+
+	sys, err := cfg.Start()
+	require.Nil(t, err, "Error starting up system")
+	defer sys.Close()
+
+	l2Seq := sys.Clients["sequencer"]
+
+	// Transactor Account
+	ethPrivKey := cfg.Secrets.Alice
+
+	// Submit a TX to L2 sequencer node
+	receiptSeq := SendL2Tx(t, cfg, l2Seq, ethPrivKey, func(opts *TxOpts) {
+		opts.ToAddr = &common.Address{0xff, 0xff}
+		opts.Value = big.NewInt(1_000_000_000)
+	})
+
+	// Gossip is able to respond to IWANT messages for the duration of heartbeat_time * message_window = 0.5 * 12 = 6
+	// Wait till we pass that, and then we'll have missed some blocks that cannot be retrieved in any way from gossip
+	time.Sleep(time.Second * 10)
+
+	// set up our syncer node, connect it to alice/bob
+	cfg.Loggers["syncer"] = testlog.Logger(t, log.LvlInfo).New("role", "syncer")
+	snapLog := log.New()
+	snapLog.SetHandler(log.DiscardHandler())
+
+	// Create a peer, and hook up alice and bob
+	h, err := sys.newMockNetPeer()
+	require.NoError(t, err)
+	_, err = sys.Mocknet.LinkPeers(sys.RollupNodes["alice"].P2P().Host().ID(), h.ID())
+	require.NoError(t, err)
+	_, err = sys.Mocknet.LinkPeers(sys.RollupNodes["bob"].P2P().Host().ID(), h.ID())
+	require.NoError(t, err)
+
+	// Configure the new rollup node that'll be syncing
+	var syncedPayloads []string
+	syncNodeCfg := &rollupNode.Config{
+		L2Sync:    &rollupNode.PreparedL2SyncEndpoint{Client: nil},
+		Driver:    driver.Config{VerifierConfDepth: 0},
+		Rollup:    *sys.RollupConfig,
+		P2PSigner: nil,
+		RPC: rollupNode.RPCConfig{
+			ListenAddr:  "127.0.0.1",
+			ListenPort:  0,
+			EnableAdmin: true,
+		},
+		P2P:                 &p2p.Prepared{HostP2P: h, EnableReqRespSync: true},
+		Metrics:             rollupNode.MetricsConfig{Enabled: false}, // no metrics server
+		Pprof:               oppprof.CLIConfig{},
+		L1EpochPollInterval: time.Second * 10,
+		Tracer: &FnTracer{
+			OnUnsafeL2PayloadFn: func(ctx context.Context, from peer.ID, payload *eth.ExecutionPayload) {
+				syncedPayloads = append(syncedPayloads, payload.ID().String())
+			},
+		},
+	}
+	configureL1(syncNodeCfg, sys.Nodes["l1"])
+	syncerL2Engine, _, err := initL2Geth("syncer", big.NewInt(int64(cfg.DeployConfig.L2ChainID)), sys.L2GenesisCfg, cfg.JWTFilePath)
+	require.NoError(t, err)
+	require.NoError(t, syncerL2Engine.Start())
+
+	configureL2(syncNodeCfg, syncerL2Engine, cfg.JWTSecret)
+
+	syncerNode, err := rollupNode.New(context.Background(), syncNodeCfg, cfg.Loggers["syncer"], snapLog, "", metrics.NewMetrics(""))
+	require.NoError(t, err)
+	err = syncerNode.Start(context.Background())
+	require.NoError(t, err)
+
+	// connect alice and bob to our new syncer node
+	_, err = sys.Mocknet.ConnectPeers(sys.RollupNodes["alice"].P2P().Host().ID(), syncerNode.P2P().Host().ID())
+	require.NoError(t, err)
+	_, err = sys.Mocknet.ConnectPeers(sys.RollupNodes["bob"].P2P().Host().ID(), syncerNode.P2P().Host().ID())
+	require.NoError(t, err)
+
+	rpc, err := syncerL2Engine.Attach()
+	require.NoError(t, err)
+	l2Verif := ethclient.NewClient(rpc)
+
+	// It may take a while to sync, but eventually we should see the sequenced data show up
+	receiptVerif, err := waitForTransaction(receiptSeq.TxHash, l2Verif, 100*time.Duration(sys.RollupConfig.BlockTime)*time.Second)
+	require.Nil(t, err, "Waiting for L2 tx on verifier")
+
+	require.Equal(t, receiptSeq, receiptVerif)
+
+	// Verify that the tx was received via P2P sync
+	require.Contains(t, syncedPayloads, eth.BlockID{Hash: receiptVerif.BlockHash, Number: receiptVerif.BlockNumber.Uint64()}.String())
+
+	// Verify that everything that was received was published
+	require.GreaterOrEqual(t, len(published), len(syncedPayloads))
+	require.ElementsMatch(t, syncedPayloads, published[:len(syncedPayloads)])
+}
+
+// TestSystemDenseTopology sets up a dense p2p topology with 3 verifier nodes and 1 sequencer node.
+func TestSystemDenseTopology(t *testing.T) {
+	t.Skip("Skipping dense topology test to avoid flakiness. @refcell address in p2p scoring pr.")
+
+	InitParallel(t)
+
+	cfg := DefaultSystemConfig(t)
+	// slow down L1 blocks so we can see the L2 blocks arrive well before the L1 blocks do.
+	// Keep the seq window small so the L2 chain is started quick
+	cfg.DeployConfig.L1BlockTime = 10
+
+	// Append additional nodes to the system to construct a dense p2p network
+	cfg.Nodes["verifier2"] = &rollupNode.Config{
+		Driver: driver.Config{
+			VerifierConfDepth:  0,
+			SequencerConfDepth: 0,
+			SequencerEnabled:   false,
+		},
+		L1EpochPollInterval: time.Second * 4,
+	}
+	cfg.Nodes["verifier3"] = &rollupNode.Config{
+		Driver: driver.Config{
+			VerifierConfDepth:  0,
+			SequencerConfDepth: 0,
+			SequencerEnabled:   false,
+		},
+		L1EpochPollInterval: time.Second * 4,
+	}
+	cfg.Loggers["verifier2"] = testlog.Logger(t, log.LvlInfo).New("role", "verifier")
+	cfg.Loggers["verifier3"] = testlog.Logger(t, log.LvlInfo).New("role", "verifier")
+
+	// connect the nodes
+	cfg.P2PTopology = map[string][]string{
+		"verifier":  {"sequencer", "verifier2", "verifier3"},
+		"verifier2": {"sequencer", "verifier", "verifier3"},
+		"verifier3": {"sequencer", "verifier", "verifier2"},
+	}
+
+	// Set peer scoring for each node, but without banning
+	for _, node := range cfg.Nodes {
+		params, err := p2p.GetScoringParams("light", &node.Rollup)
+		require.NoError(t, err)
+		node.P2P = &p2p.Config{
+			ScoringParams:  params,
+			BanningEnabled: false,
+		}
+	}
+
+	var published, received1, received2, received3 []common.Hash
+	seqTracer, verifTracer, verifTracer2, verifTracer3 := new(FnTracer), new(FnTracer), new(FnTracer), new(FnTracer)
+	seqTracer.OnPublishL2PayloadFn = func(ctx context.Context, payload *eth.ExecutionPayload) {
+		published = append(published, payload.BlockHash)
+	}
+	verifTracer.OnUnsafeL2PayloadFn = func(ctx context.Context, from peer.ID, payload *eth.ExecutionPayload) {
+		received1 = append(received1, payload.BlockHash)
+	}
+	verifTracer2.OnUnsafeL2PayloadFn = func(ctx context.Context, from peer.ID, payload *eth.ExecutionPayload) {
+		received2 = append(received2, payload.BlockHash)
+	}
+	verifTracer3.OnUnsafeL2PayloadFn = func(ctx context.Context, from peer.ID, payload *eth.ExecutionPayload) {
+		received3 = append(received3, payload.BlockHash)
+	}
+	cfg.Nodes["sequencer"].Tracer = seqTracer
+	cfg.Nodes["verifier"].Tracer = verifTracer
+	cfg.Nodes["verifier2"].Tracer = verifTracer2
+	cfg.Nodes["verifier3"].Tracer = verifTracer3
+
+	sys, err := cfg.Start()
+	require.Nil(t, err, "Error starting up system")
+	defer sys.Close()
+
+	l2Seq := sys.Clients["sequencer"]
+	l2Verif := sys.Clients["verifier"]
+	l2Verif2 := sys.Clients["verifier2"]
+	l2Verif3 := sys.Clients["verifier3"]
+
+	// Transactor Account
+	ethPrivKey := cfg.Secrets.Alice
+
+	// Submit TX to L2 sequencer node
+	receiptSeq := SendL2Tx(t, cfg, l2Seq, ethPrivKey, func(opts *TxOpts) {
+		opts.ToAddr = &common.Address{0xff, 0xff}
+		opts.Value = big.NewInt(1_000_000_000)
+
+		// Wait until the block it was first included in shows up in the safe chain on the verifiers
+		opts.VerifyOnClients(l2Verif, l2Verif2, l2Verif3)
+	})
+
+	// Verify that everything that was received was published
+	require.GreaterOrEqual(t, len(published), len(received1))
+	require.GreaterOrEqual(t, len(published), len(received2))
+	require.GreaterOrEqual(t, len(published), len(received3))
+	require.ElementsMatch(t, published, received1[:len(published)])
+	require.ElementsMatch(t, published, received2[:len(published)])
+	require.ElementsMatch(t, published, received3[:len(published)])
+
+	// Verify that the tx was received via p2p
+	require.Contains(t, received1, receiptSeq.BlockHash)
+	require.Contains(t, received2, receiptSeq.BlockHash)
+	require.Contains(t, received3, receiptSeq.BlockHash)
 }
 
 func TestL1InfoContract(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
 
@@ -753,32 +981,11 @@ func calcGasFees(gasUsed uint64, gasTipCap *big.Int, gasFeeCap *big.Int, baseFee
 	return x.Mul(x, new(big.Int).SetUint64(gasUsed))
 }
 
-// calcL1GasUsed returns the gas used to include the transaction data in
-// the calldata on L1
-func calcL1GasUsed(data []byte, overhead *big.Int) *big.Int {
-	var zeroes, ones uint64
-	for _, byt := range data {
-		if byt == 0 {
-			zeroes++
-		} else {
-			ones++
-		}
-	}
-
-	zeroesGas := zeroes * 4     // params.TxDataZeroGas
-	onesGas := (ones + 68) * 16 // params.TxDataNonZeroGasEIP2028
-	l1Gas := new(big.Int).SetUint64(zeroesGas + onesGas)
-	return new(big.Int).Add(l1Gas, overhead)
-}
-
 // TestWithdrawals checks that a deposit and then withdrawal execution succeeds. It verifies the
 // balance changes on L1 and L2 and has to include gas fees in the balance checks.
 // It does not check that the withdrawal can be executed prior to the end of the finality period.
 func TestWithdrawals(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
 	cfg.DeployConfig.FinalizationPeriodSeconds = 2 // 2s finalization period
@@ -795,10 +1002,6 @@ func TestWithdrawals(t *testing.T) {
 	ethPrivKey := cfg.Secrets.Alice
 	fromAddr := crypto.PubkeyToAddress(ethPrivKey.PublicKey)
 
-	// Find deposit contract
-	depositContract, err := bindings.NewOptimismPortal(predeploys.DevOptimismPortalAddr, l1Client)
-	require.Nil(t, err)
-
 	// Create L1 signer
 	opts, err := bind.NewKeyedTransactorWithChainID(ethPrivKey, cfg.L1ChainIDBig())
 	require.Nil(t, err)
@@ -809,26 +1012,12 @@ func TestWithdrawals(t *testing.T) {
 	startBalance, err := l2Verif.BalanceAt(ctx, fromAddr, nil)
 	require.Nil(t, err)
 
-	// Finally send TX
+	// Send deposit tx
 	mintAmount := big.NewInt(1_000_000_000_000)
 	opts.Value = mintAmount
-	tx, err := depositContract.DepositTransaction(opts, fromAddr, common.Big0, 1_000_000, false, nil)
-	require.Nil(t, err, "with deposit tx")
-
-	receipt, err := waitForTransaction(tx.Hash(), l1Client, 3*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for deposit tx on L1")
-
-	// Bind L2 Withdrawer Contract
-	l2withdrawer, err := bindings.NewL2ToL1MessagePasser(predeploys.L2ToL1MessagePasserAddr, l2Seq)
-	require.Nil(t, err, "binding withdrawer on L2")
-
-	// Wait for deposit to arrive
-	reconstructedDep, err := derive.UnmarshalDepositLogEvent(receipt.Logs[0])
-	require.NoError(t, err, "Could not reconstruct L2 Deposit")
-	tx = types.NewTx(reconstructedDep)
-	receipt, err = waitForTransaction(tx.Hash(), l2Verif, 10*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.NoError(t, err)
-	require.Equal(t, receipt.Status, types.ReceiptStatusSuccessful)
+	SendDepositTx(t, cfg, l1Client, l2Verif, opts, func(l2Opts *DepositTxOpts) {
+		l2Opts.Value = common.Big0
+	})
 
 	// Confirm L2 balance
 	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
@@ -846,17 +1035,11 @@ func TestWithdrawals(t *testing.T) {
 	startBalance, err = l2Seq.BalanceAt(ctx, fromAddr, nil)
 	require.Nil(t, err)
 
-	// Intiate Withdrawal
 	withdrawAmount := big.NewInt(500_000_000_000)
-	l2opts, err := bind.NewKeyedTransactorWithChainID(ethPrivKey, cfg.L2ChainIDBig())
-	require.Nil(t, err)
-	l2opts.Value = withdrawAmount
-	tx, err = l2withdrawer.InitiateWithdrawal(l2opts, fromAddr, big.NewInt(21000), nil)
-	require.Nil(t, err, "sending initiate withdraw tx")
-
-	receipt, err = waitForTransaction(tx.Hash(), l2Verif, 10*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "withdrawal initiated on L2 sequencer")
-	require.Equal(t, receipt.Status, types.ReceiptStatusSuccessful, "transaction failed")
+	tx, receipt := SendWithdrawal(t, cfg, l2Seq, ethPrivKey, func(opts *WithdrawalTxOpts) {
+		opts.Value = withdrawAmount
+		opts.VerifyOnClients(l2Verif)
+	})
 
 	// Verify L2 balance after withdrawal
 	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
@@ -882,87 +1065,9 @@ func TestWithdrawals(t *testing.T) {
 	startBalance, err = l1Client.BalanceAt(ctx, fromAddr, nil)
 	require.Nil(t, err)
 
-	// Get l2BlockNumber for proof generation
-	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	defer cancel()
-	blockNumber, err := withdrawals.WaitForFinalizationPeriod(ctx, l1Client, predeploys.DevOptimismPortalAddr, receipt.BlockNumber)
-	require.Nil(t, err)
-
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	header, err = l2Verif.HeaderByNumber(ctx, new(big.Int).SetUint64(blockNumber))
-	require.Nil(t, err)
-
-	rpcClient, err := rpc.Dial(sys.Nodes["verifier"].WSEndpoint())
-	require.Nil(t, err)
-	proofCl := gethclient.New(rpcClient)
-	receiptCl := ethclient.NewClient(rpcClient)
-
-	// Now create withdrawal
-	oracle, err := bindings.NewL2OutputOracleCaller(predeploys.DevL2OutputOracleAddr, l1Client)
-	require.Nil(t, err)
-
-	params, err := withdrawals.ProveWithdrawalParameters(context.Background(), proofCl, receiptCl, tx.Hash(), header, oracle)
-	require.Nil(t, err)
-
-	portal, err := bindings.NewOptimismPortal(predeploys.DevOptimismPortalAddr, l1Client)
-	require.Nil(t, err)
-
-	opts.Value = nil
-
-	// Prove withdrawal
-	tx, err = portal.ProveWithdrawalTransaction(
-		opts,
-		bindings.TypesWithdrawalTransaction{
-			Nonce:    params.Nonce,
-			Sender:   params.Sender,
-			Target:   params.Target,
-			Value:    params.Value,
-			GasLimit: params.GasLimit,
-			Data:     params.Data,
-		},
-		params.L2OutputIndex,
-		params.OutputRootProof,
-		params.WithdrawalProof,
-	)
-	require.Nil(t, err)
-
-	// Ensure that our withdrawal was proved successfully
-	proveReceipt, err := waitForTransaction(tx.Hash(), l1Client, 3*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "prove withdrawal")
-	require.Equal(t, types.ReceiptStatusSuccessful, proveReceipt.Status)
-
-	// Wait for finalization and then create the Finalized Withdrawal Transaction
-	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	defer cancel()
-	_, err = withdrawals.WaitForFinalizationPeriod(ctx, l1Client, predeploys.DevOptimismPortalAddr, header.Number)
-	require.Nil(t, err)
-
-	// Finalize withdrawal
-	tx, err = portal.FinalizeWithdrawalTransaction(
-		opts,
-		bindings.TypesWithdrawalTransaction{
-			Nonce:    params.Nonce,
-			Sender:   params.Sender,
-			Target:   params.Target,
-			Value:    params.Value,
-			GasLimit: params.GasLimit,
-			Data:     params.Data,
-		},
-	)
-	require.Nil(t, err)
-
-	// Ensure that our withdrawal was finalized successfully
-	finalizeReceipt, err := waitForTransaction(tx.Hash(), l1Client, 3*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "finalize withdrawal")
-	require.Equal(t, types.ReceiptStatusSuccessful, finalizeReceipt.Status)
+	proveReceipt, finalizeReceipt := ProveAndFinalizeWithdrawal(t, cfg, l1Client, sys.Nodes["verifier"], ethPrivKey, receipt)
 
 	// Verify balance after withdrawal
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	header, err = l1Client.HeaderByNumber(ctx, finalizeReceipt.BlockNumber)
-	require.Nil(t, err)
-
 	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	endBalance, err = l1Client.BalanceAt(ctx, fromAddr, nil)
@@ -972,23 +1077,21 @@ func TestWithdrawals(t *testing.T) {
 	// Fun fact, the fee is greater than the withdrawal amount
 	// NOTE: The gas fees include *both* the ProveWithdrawalTransaction and FinalizeWithdrawalTransaction transactions.
 	diff = new(big.Int).Sub(endBalance, startBalance)
-	fees = calcGasFees(proveReceipt.GasUsed+finalizeReceipt.GasUsed, tx.GasTipCap(), tx.GasFeeCap(), header.BaseFee)
+	proveFee := new(big.Int).Mul(new(big.Int).SetUint64(proveReceipt.GasUsed), proveReceipt.EffectiveGasPrice)
+	finalizeFee := new(big.Int).Mul(new(big.Int).SetUint64(finalizeReceipt.GasUsed), finalizeReceipt.EffectiveGasPrice)
+	fees = new(big.Int).Add(proveFee, finalizeFee)
 	withdrawAmount = withdrawAmount.Sub(withdrawAmount, fees)
 	require.Equal(t, withdrawAmount, diff)
 }
 
 // TestFees checks that L1/L2 fees are handled.
 func TestFees(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
-	// TODO: after we have the system config contract and new op-geth L1 cost utils,
-	// we can pull in l1 costs into every e2e test and account for it in assertions easily etc.
-	cfg.DeployConfig.GasPriceOracleOverhead = 2100
-	cfg.DeployConfig.GasPriceOracleScalar = 1000_000
+	// This test only works with these config values modified
+	cfg.DeployConfig.L2GenesisRegolithTimeOffset = nil
+	cfg.DeployConfig.L1GenesisBlockBaseFeePerGas = (*hexutil.Big)(big.NewInt(7))
 
 	sys, err := cfg.Start()
 	require.Nil(t, err, "Error starting up system")
@@ -996,10 +1099,20 @@ func TestFees(t *testing.T) {
 
 	l2Seq := sys.Clients["sequencer"]
 	l2Verif := sys.Clients["verifier"]
+	l1 := sys.Clients["l1"]
+
+	seqBackend := sys.Backends["sequencer"]
+	seqState, err := seqBackend.BlockChain().State()
+	require.Nil(t, err, "Error getting sequencer state")
+
+	l1CostFn := types.NewL1CostFunc(seqBackend.BlockChain().Config(), seqState)
 
 	// Transactor Account
 	ethPrivKey := cfg.Secrets.Alice
 	fromAddr := crypto.PubkeyToAddress(ethPrivKey.PublicKey)
+
+	require.NotEqual(t, cfg.DeployConfig.L2OutputOracleProposer, fromAddr)
+	require.NotEqual(t, cfg.DeployConfig.BatchSenderAddress, fromAddr)
 
 	// Find gaspriceoracle contract
 	gpoContract, err := bindings.NewGasPriceOracle(predeploys.GasPriceOracleAddr, l2Seq)
@@ -1012,114 +1125,102 @@ func TestFees(t *testing.T) {
 	scalar, err := gpoContract.Scalar(&bind.CallOpts{})
 	require.Nil(t, err, "reading gpo scalar")
 
-	require.Equal(t, overhead.Uint64(), uint64(2100), "wrong gpo overhead")
+	require.Equal(t, overhead.Uint64(), cfg.DeployConfig.GasPriceOracleOverhead, "wrong gpo overhead")
 	require.Equal(t, decimals.Uint64(), uint64(6), "wrong gpo decimals")
-	require.Equal(t, scalar.Uint64(), uint64(1_000_000), "wrong gpo scalar")
+	require.Equal(t, scalar.Uint64(), cfg.DeployConfig.GasPriceOracleScalar, "wrong gpo scalar")
 
 	// BaseFee Recipient
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	baseFeeRecipientStartBalance, err := l2Seq.BalanceAt(ctx, predeploys.BaseFeeVaultAddr, nil)
+	baseFeeRecipientStartBalance, err := l2Seq.BalanceAt(context.Background(), predeploys.BaseFeeVaultAddr, big.NewInt(rpc.EarliestBlockNumber.Int64()))
 	require.Nil(t, err)
 
 	// L1Fee Recipient
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	l1FeeRecipientStartBalance, err := l2Seq.BalanceAt(ctx, predeploys.L1FeeVaultAddr, nil)
+	l1FeeRecipientStartBalance, err := l2Seq.BalanceAt(context.Background(), predeploys.L1FeeVaultAddr, big.NewInt(rpc.EarliestBlockNumber.Int64()))
 	require.Nil(t, err)
+
+	sequencerFeeVaultStartBalance, err := l2Seq.BalanceAt(context.Background(), predeploys.SequencerFeeVaultAddr, big.NewInt(rpc.EarliestBlockNumber.Int64()))
+	require.Nil(t, err)
+
+	genesisBlock, err := l2Seq.BlockByNumber(context.Background(), big.NewInt(rpc.EarliestBlockNumber.Int64()))
+	require.NoError(t, err)
+
+	coinbaseStartBalance, err := l2Seq.BalanceAt(context.Background(), genesisBlock.Coinbase(), big.NewInt(rpc.EarliestBlockNumber.Int64()))
+	require.NoError(t, err)
 
 	// Simple transfer from signer to random account
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	startBalance, err := l2Verif.BalanceAt(ctx, fromAddr, nil)
+	startBalance, err := l2Seq.BalanceAt(context.Background(), fromAddr, big.NewInt(rpc.EarliestBlockNumber.Int64()))
 	require.Nil(t, err)
+	require.Greater(t, startBalance.Uint64(), big.NewInt(params.Ether).Uint64())
 
-	toAddr := common.Address{0xff, 0xff}
-	transferAmount := big.NewInt(1_000_000_000)
+	transferAmount := big.NewInt(params.Ether)
 	gasTip := big.NewInt(10)
-	tx := types.MustSignNewTx(ethPrivKey, types.LatestSignerForChainID(cfg.L2ChainIDBig()), &types.DynamicFeeTx{
-		ChainID:   cfg.L2ChainIDBig(),
-		Nonce:     0,
-		To:        &toAddr,
-		Value:     transferAmount,
-		GasTipCap: gasTip,
-		GasFeeCap: big.NewInt(200),
-		Gas:       21000,
+	receipt := SendL2Tx(t, cfg, l2Seq, ethPrivKey, func(opts *TxOpts) {
+		opts.ToAddr = &common.Address{0xff, 0xff}
+		opts.Value = transferAmount
+		opts.GasTipCap = gasTip
+		opts.Gas = 21000
+		opts.GasFeeCap = big.NewInt(200)
+		opts.VerifyOnClients(l2Verif)
 	})
-	sender, err := types.LatestSignerForChainID(cfg.L2ChainIDBig()).Sender(tx)
-	require.NoError(t, err)
-	t.Logf("waiting for tx %s from %s to %s", tx.Hash(), sender, tx.To())
-	err = l2Seq.SendTransaction(context.Background(), tx)
-	require.Nil(t, err, "Sending L2 tx to sequencer")
 
-	_, err = waitForTransaction(tx.Hash(), l2Seq, 4*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for L2 tx on sequencer")
+	require.Equal(t, receipt.Status, types.ReceiptStatusSuccessful)
 
-	receipt, err := waitForTransaction(tx.Hash(), l2Verif, 4*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-	require.Nil(t, err, "Waiting for L2 tx on verifier")
-	require.Equal(t, types.ReceiptStatusSuccessful, receipt.Status, "TX should have succeeded")
-
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	header, err := l2Seq.HeaderByNumber(ctx, receipt.BlockNumber)
+	header, err := l2Seq.HeaderByNumber(context.Background(), receipt.BlockNumber)
 	require.Nil(t, err)
 
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	coinbaseStartBalance, err := l2Seq.BalanceAt(ctx, header.Coinbase, safeAddBig(header.Number, big.NewInt(-1)))
+	coinbaseEndBalance, err := l2Seq.BalanceAt(context.Background(), header.Coinbase, header.Number)
 	require.Nil(t, err)
 
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	coinbaseEndBalance, err := l2Seq.BalanceAt(ctx, header.Coinbase, header.Number)
+	endBalance, err := l2Seq.BalanceAt(context.Background(), fromAddr, header.Number)
 	require.Nil(t, err)
 
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	endBalance, err := l2Seq.BalanceAt(ctx, fromAddr, header.Number)
+	baseFeeRecipientEndBalance, err := l2Seq.BalanceAt(context.Background(), predeploys.BaseFeeVaultAddr, header.Number)
 	require.Nil(t, err)
 
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	baseFeeRecipientEndBalance, err := l2Seq.BalanceAt(ctx, predeploys.BaseFeeVaultAddr, header.Number)
+	l1Header, err := l1.HeaderByNumber(context.Background(), nil)
 	require.Nil(t, err)
 
-	l1Header, err := sys.Clients["l1"].HeaderByNumber(ctx, nil)
+	l1FeeRecipientEndBalance, err := l2Seq.BalanceAt(context.Background(), predeploys.L1FeeVaultAddr, header.Number)
 	require.Nil(t, err)
 
-	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	l1FeeRecipientEndBalance, err := l2Seq.BalanceAt(ctx, predeploys.L1FeeVaultAddr, header.Number)
+	sequencerFeeVaultEndBalance, err := l2Seq.BalanceAt(context.Background(), predeploys.SequencerFeeVaultAddr, header.Number)
 	require.Nil(t, err)
 
 	// Diff fee recipient + coinbase balances
 	baseFeeRecipientDiff := new(big.Int).Sub(baseFeeRecipientEndBalance, baseFeeRecipientStartBalance)
 	l1FeeRecipientDiff := new(big.Int).Sub(l1FeeRecipientEndBalance, l1FeeRecipientStartBalance)
+	sequencerFeeVaultDiff := new(big.Int).Sub(sequencerFeeVaultEndBalance, sequencerFeeVaultStartBalance)
 	coinbaseDiff := new(big.Int).Sub(coinbaseEndBalance, coinbaseStartBalance)
 
 	// Tally L2 Fee
 	l2Fee := gasTip.Mul(gasTip, new(big.Int).SetUint64(receipt.GasUsed))
+	require.Equal(t, sequencerFeeVaultDiff, coinbaseDiff, "coinbase is always sequencer fee vault")
 	require.Equal(t, l2Fee, coinbaseDiff, "l2 fee mismatch")
+	require.Equal(t, l2Fee, sequencerFeeVaultDiff)
 
 	// Tally BaseFee
 	baseFee := new(big.Int).Mul(header.BaseFee, new(big.Int).SetUint64(receipt.GasUsed))
 	require.Equal(t, baseFee, baseFeeRecipientDiff, "base fee fee mismatch")
 
 	// Tally L1 Fee
+	tx, _, err := l2Seq.TransactionByHash(context.Background(), receipt.TxHash)
+	require.NoError(t, err, "Should be able to get transaction")
 	bytes, err := tx.MarshalBinary()
 	require.Nil(t, err)
-	l1GasUsed := calcL1GasUsed(bytes, overhead)
-	divisor := new(big.Int).Exp(big.NewInt(10), decimals, nil)
-	l1Fee := new(big.Int).Mul(l1GasUsed, l1Header.BaseFee)
-	l1Fee = l1Fee.Mul(l1Fee, scalar)
-	l1Fee = l1Fee.Div(l1Fee, divisor)
 
-	require.Equal(t, l1Fee, l1FeeRecipientDiff, "l1 fee mismatch")
+	l1Fee := l1CostFn(receipt.BlockNumber.Uint64(), header.Time, tx.RollupDataGas(), tx.IsSystemTx())
+	require.Equalf(t, l1Fee, l1FeeRecipientDiff, "L1 fee mismatch: start balance %v, end balance %v", l1FeeRecipientStartBalance, l1FeeRecipientEndBalance)
 
-	// Tally L1 fee against GasPriceOracle
 	gpoL1Fee, err := gpoContract.GetL1Fee(&bind.CallOpts{}, bytes)
 	require.Nil(t, err)
-	require.Equal(t, l1Fee, gpoL1Fee, "l1 fee mismatch")
+	require.Equal(t, l1Fee, gpoL1Fee, "GPO reports L1 fee mismatch")
+
+	require.Equal(t, receipt.L1Fee, l1Fee, "l1 fee in receipt is correct")
+	require.Equal(t,
+		new(big.Float).Mul(
+			new(big.Float).SetInt(l1Header.BaseFee),
+			new(big.Float).Mul(new(big.Float).SetInt(receipt.L1GasUsed), receipt.FeeScalar),
+		),
+		new(big.Float).SetInt(receipt.L1Fee), "fee field in receipt matches gas used times scalar times basefee")
 
 	// Calculate total fee
 	baseFeeRecipientDiff.Add(baseFeeRecipientDiff, coinbaseDiff)
@@ -1129,52 +1230,127 @@ func TestFees(t *testing.T) {
 	require.Equal(t, balanceDiff, totalFee, "balances should add up")
 }
 
-func TestStopStartSequencer(t *testing.T) {
-	parallel(t)
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+func TestStopStartBatcher(t *testing.T) {
+	InitParallel(t)
 
 	cfg := DefaultSystemConfig(t)
 	sys, err := cfg.Start()
 	require.Nil(t, err, "Error starting up system")
 	defer sys.Close()
 
+	rollupRPCClient, err := rpc.DialContext(context.Background(), sys.RollupNodes["verifier"].HTTPEndpoint())
+	require.Nil(t, err)
+	rollupClient := sources.NewRollupClient(client.NewBaseRPCClient(rollupRPCClient))
+
 	l2Seq := sys.Clients["sequencer"]
-	rollupNode := sys.RollupNodes["sequencer"]
+	l2Verif := sys.Clients["verifier"]
 
-	nodeRPC, err := rpc.DialContext(context.Background(), rollupNode.HTTPEndpoint())
-	require.Nil(t, err, "Error dialing node")
+	// retrieve the initial sync status
+	seqStatus, err := rollupClient.SyncStatus(context.Background())
+	require.Nil(t, err)
 
-	blockBefore := latestBlock(t, l2Seq)
-	time.Sleep(time.Duration(cfg.DeployConfig.L2BlockTime+1) * time.Second)
-	blockAfter := latestBlock(t, l2Seq)
-	require.Greaterf(t, blockAfter, blockBefore, "Chain did not advance")
+	nonce := uint64(0)
+	sendTx := func() *types.Receipt {
+		// Submit TX to L2 sequencer node
+		receipt := SendL2Tx(t, cfg, l2Seq, cfg.Secrets.Alice, func(opts *TxOpts) {
+			opts.ToAddr = &common.Address{0xff, 0xff}
+			opts.Value = big.NewInt(1_000_000_000)
+			opts.Nonce = nonce
+		})
+		nonce++
+		return receipt
+	}
+	// send a transaction
+	receipt := sendTx()
+
+	// wait until the block the tx was first included in shows up in the safe chain on the verifier
+	safeBlockInclusionDuration := time.Duration(6*cfg.DeployConfig.L1BlockTime) * time.Second
+	_, err = waitForBlock(receipt.BlockNumber, l2Verif, safeBlockInclusionDuration)
+	require.Nil(t, err, "Waiting for block on verifier")
+
+	// ensure the safe chain advances
+	newSeqStatus, err := rollupClient.SyncStatus(context.Background())
+	require.Nil(t, err)
+	require.Greater(t, newSeqStatus.SafeL2.Number, seqStatus.SafeL2.Number, "Safe chain did not advance")
+
+	// stop the batch submission
+	err = sys.BatchSubmitter.Stop(context.Background())
+	require.Nil(t, err)
+
+	// wait for any old safe blocks being submitted / derived
+	time.Sleep(safeBlockInclusionDuration)
+
+	// get the initial sync status
+	seqStatus, err = rollupClient.SyncStatus(context.Background())
+	require.Nil(t, err)
+
+	// send another tx
+	sendTx()
+	time.Sleep(safeBlockInclusionDuration)
+
+	// ensure that the safe chain does not advance while the batcher is stopped
+	newSeqStatus, err = rollupClient.SyncStatus(context.Background())
+	require.Nil(t, err)
+	require.Equal(t, newSeqStatus.SafeL2.Number, seqStatus.SafeL2.Number, "Safe chain advanced while batcher was stopped")
+
+	// start the batch submission
+	err = sys.BatchSubmitter.Start()
+	require.Nil(t, err)
+	time.Sleep(safeBlockInclusionDuration)
+
+	// send a third tx
+	receipt = sendTx()
+
+	// wait until the block the tx was first included in shows up in the safe chain on the verifier
+	_, err = waitForBlock(receipt.BlockNumber, l2Verif, safeBlockInclusionDuration)
+	require.Nil(t, err, "Waiting for block on verifier")
+
+	// ensure that the safe chain advances after restarting the batcher
+	newSeqStatus, err = rollupClient.SyncStatus(context.Background())
+	require.Nil(t, err)
+	require.Greater(t, newSeqStatus.SafeL2.Number, seqStatus.SafeL2.Number, "Safe chain did not advance after batcher was restarted")
+}
+
+func TestBatcherMultiTx(t *testing.T) {
+	InitParallel(t)
+
+	cfg := DefaultSystemConfig(t)
+	cfg.BatcherTargetL1TxSizeBytes = 2 // ensures that batcher txs are as small as possible
+	cfg.DisableBatcher = true
+	sys, err := cfg.Start()
+	require.Nil(t, err, "Error starting up system")
+	defer sys.Close()
+
+	l1Client := sys.Clients["l1"]
+	l2Seq := sys.Clients["sequencer"]
+
+	_, err = waitForBlock(big.NewInt(10), l2Seq, time.Duration(cfg.DeployConfig.L2BlockTime*15)*time.Second)
+	require.Nil(t, err, "Waiting for L2 blocks")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	blockHash := common.Hash{}
-	err = nodeRPC.CallContext(ctx, &blockHash, "admin_stopSequencer")
-	require.Nil(t, err, "Error stopping sequencer")
+	l1Number, err := l1Client.BlockNumber(ctx)
+	require.Nil(t, err)
 
-	blockBefore = latestBlock(t, l2Seq)
-	time.Sleep(time.Duration(cfg.DeployConfig.L2BlockTime+1) * time.Second)
-	blockAfter = latestBlock(t, l2Seq)
-	require.Equal(t, blockAfter, blockBefore, "Chain advanced after stopping sequencer")
+	// start batch submission
+	err = sys.BatchSubmitter.Start()
+	require.Nil(t, err)
 
-	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	err = nodeRPC.CallContext(ctx, nil, "admin_startSequencer", blockHash)
-	require.Nil(t, err, "Error starting sequencer")
+	totalTxCount := 0
+	// wait for up to 10 L1 blocks, usually only 3 is required, but it's
+	// possible additional L1 blocks will be created before the batcher starts,
+	// so we wait additional blocks.
+	for i := int64(0); i < 10; i++ {
+		block, err := waitForBlock(big.NewInt(int64(l1Number)+i), l1Client, time.Duration(cfg.DeployConfig.L1BlockTime*5)*time.Second)
+		require.Nil(t, err, "Waiting for l1 blocks")
+		totalTxCount += len(block.Transactions())
 
-	blockBefore = latestBlock(t, l2Seq)
-	time.Sleep(time.Duration(cfg.DeployConfig.L2BlockTime+1) * time.Second)
-	blockAfter = latestBlock(t, l2Seq)
-	require.Greater(t, blockAfter, blockBefore, "Chain did not advance after starting sequencer")
-}
+		if totalTxCount >= 10 {
+			return
+		}
+	}
 
-func safeAddBig(a *big.Int, b *big.Int) *big.Int {
-	return new(big.Int).Add(a, b)
+	t.Fatal("Expected at least 10 transactions from the batcher")
 }
 
 func latestBlock(t *testing.T, client *ethclient.Client) uint64 {
@@ -1183,4 +1359,46 @@ func latestBlock(t *testing.T, client *ethclient.Client) uint64 {
 	blockAfter, err := client.BlockNumber(ctx)
 	require.Nil(t, err, "Error getting latest block")
 	return blockAfter
+}
+
+// TestPendingBlockIsLatest tests that we serve the latest block as pending block
+func TestPendingBlockIsLatest(t *testing.T) {
+	InitParallel(t)
+
+	cfg := DefaultSystemConfig(t)
+	sys, err := cfg.Start()
+	require.Nil(t, err, "Error starting up system")
+	defer sys.Close()
+	l2Seq := sys.Clients["sequencer"]
+
+	t.Run("block", func(t *testing.T) {
+		for i := 0; i < 10; i++ {
+			// TODO(CLI-4044): pending-block ID change
+			pending, err := l2Seq.BlockByNumber(context.Background(), big.NewInt(-1))
+			require.NoError(t, err)
+			latest, err := l2Seq.BlockByNumber(context.Background(), nil)
+			require.NoError(t, err)
+			if pending.NumberU64() == latest.NumberU64() {
+				require.Equal(t, pending.Hash(), latest.Hash(), "pending must exactly match latest block")
+				return
+			}
+			// re-try until we have the same number, as the requests are not an atomic bundle, and the sequencer may create a block.
+		}
+		t.Fatal("failed to get pending block with same number as latest block")
+	})
+	t.Run("header", func(t *testing.T) {
+		for i := 0; i < 10; i++ {
+			// TODO(CLI-4044): pending-block ID change
+			pending, err := l2Seq.HeaderByNumber(context.Background(), big.NewInt(-1))
+			require.NoError(t, err)
+			latest, err := l2Seq.HeaderByNumber(context.Background(), nil)
+			require.NoError(t, err)
+			if pending.Number.Uint64() == latest.Number.Uint64() {
+				require.Equal(t, pending.Hash(), latest.Hash(), "pending must exactly match latest header")
+				return
+			}
+			// re-try until we have the same number, as the requests are not an atomic bundle, and the sequencer may create a block.
+		}
+		t.Fatal("failed to get pending header with same number as latest header")
+	})
 }

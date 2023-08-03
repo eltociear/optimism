@@ -24,7 +24,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethclient/gethclient"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	fuzz "github.com/google/gofuzz"
@@ -33,17 +32,12 @@ import (
 
 // TestGasPriceOracleFeeUpdates checks that the gas price oracle cannot be locked by mis-configuring parameters.
 func TestGasPriceOracleFeeUpdates(t *testing.T) {
-	parallel(t)
+	InitParallel(t)
 	// Define our values to set in the GasPriceOracle (we set them high to see if it can lock L2 or stop bindings
 	// from updating the prices once again.
 	overheadValue := abi.MaxUint256
 	scalarValue := abi.MaxUint256
 	var cancel context.CancelFunc
-
-	// Setup our logger handler
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
 
 	// Create our system configuration for L1/L2 and start it
 	cfg := DefaultSystemConfig(t)
@@ -58,7 +52,7 @@ func TestGasPriceOracleFeeUpdates(t *testing.T) {
 	ethPrivKey := cfg.Secrets.SysCfgOwner
 
 	// Bind to the SystemConfig & GasPriceOracle contracts
-	sysconfig, err := bindings.NewSystemConfig(predeploys.DevSystemConfigAddr, l1Client)
+	sysconfig, err := bindings.NewSystemConfig(cfg.L1Deployments.SystemConfigProxy, l1Client)
 	require.Nil(t, err)
 	gpoContract, err := bindings.NewGasPriceOracleCaller(predeploys.GasPriceOracleAddr, l2Seq)
 	require.Nil(t, err)
@@ -126,11 +120,7 @@ func TestGasPriceOracleFeeUpdates(t *testing.T) {
 // TestL2SequencerRPCDepositTx checks that the L2 sequencer will not accept DepositTx type transactions.
 // The acceptance of these transactions would allow for arbitrary minting of ETH in L2.
 func TestL2SequencerRPCDepositTx(t *testing.T) {
-	parallel(t)
-	// Setup our logger handler
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	// Create our system configuration for L1/L2 and start it
 	cfg := DefaultSystemConfig(t)
@@ -233,18 +223,13 @@ func startConfigWithTestAccounts(cfg *SystemConfig, accountsToGenerate int) (*Sy
 // TestMixedDepositValidity makes a number of deposit transactions, some which will succeed in transferring value,
 // while others do not. It ensures that the expected nonces/balances match after several interactions.
 func TestMixedDepositValidity(t *testing.T) {
-	parallel(t)
+	InitParallel(t)
 	// Define how many deposit txs we'll make. Each deposit mints a fixed amount and transfers up to 1/3 of the user's
 	// balance. As such, this number cannot be too high or else the test will always fail due to lack of balance in L1.
 	const depositTxCount = 15
 
 	// Define how many accounts we'll use to deposit funds
 	const accountUsedToDeposit = 5
-
-	// Setup our logger handler
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
 
 	// Create our system configuration, funding all accounts we created for L1/L2, and start it
 	cfg := DefaultSystemConfig(t)
@@ -262,7 +247,7 @@ func TestMixedDepositValidity(t *testing.T) {
 	txTimeoutDuration := 10 * time.Duration(cfg.DeployConfig.L1BlockTime) * time.Second
 
 	// Bind to the deposit contract
-	depositContract, err := bindings.NewOptimismPortal(predeploys.DevOptimismPortalAddr, l1Client)
+	depositContract, err := bindings.NewOptimismPortal(cfg.L1Deployments.OptimismPortalProxy, l1Client)
 	require.NoError(t, err)
 
 	// Create a struct used to track our transactors and their transactions sent.
@@ -415,20 +400,19 @@ func TestMixedDepositValidity(t *testing.T) {
 // TestMixedWithdrawalValidity makes a number of withdrawal transactions and ensures ones with modified parameters are
 // rejected while unmodified ones are accepted. This runs test cases in different systems.
 func TestMixedWithdrawalValidity(t *testing.T) {
-	parallel(t)
-	// Setup our logger handler
-	if !verboseGethNodes {
-		log.Root().SetHandler(log.DiscardHandler())
-	}
+	InitParallel(t)
 
 	// There are 7 different fields we try modifying to cause a failure, plus one "good" test result we test.
 	for i := 0; i <= 8; i++ {
 		i := i // avoid loop var capture
 		t.Run(fmt.Sprintf("withdrawal test#%d", i+1), func(t *testing.T) {
-			t.Parallel()
+			InitParallel(t)
+
 			// Create our system configuration, funding all accounts we created for L1/L2, and start it
 			cfg := DefaultSystemConfig(t)
-			cfg.DeployConfig.FinalizationPeriodSeconds = 6
+			cfg.DeployConfig.L2BlockTime = 2
+			require.LessOrEqual(t, cfg.DeployConfig.FinalizationPeriodSeconds, uint64(6))
+			require.Equal(t, cfg.DeployConfig.FundDevAccounts, true)
 			sys, err := cfg.Start()
 			require.NoError(t, err, "error starting up system")
 			defer sys.Close()
@@ -439,13 +423,36 @@ func TestMixedWithdrawalValidity(t *testing.T) {
 			l2Verif := sys.Clients["verifier"]
 			require.NoError(t, err)
 
+			systemConfig, err := bindings.NewSystemConfigCaller(cfg.L1Deployments.SystemConfig, l1Client)
+			require.NoError(t, err)
+			unsafeBlockSigner, err := systemConfig.UnsafeBlockSigner(nil)
+			require.NoError(t, err)
+			require.Equal(t, cfg.DeployConfig.P2PSequencerAddress, unsafeBlockSigner)
+
+			// The batcher has balance on L1
+			batcherBalance, err := l1Client.BalanceAt(context.Background(), cfg.DeployConfig.BatchSenderAddress, nil)
+			require.NoError(t, err)
+			require.NotEqual(t, batcherBalance, big.NewInt(0))
+
+			// The proposer has balance on L1
+			proposerBalance, err := l1Client.BalanceAt(context.Background(), cfg.DeployConfig.L2OutputOracleProposer, nil)
+			require.NoError(t, err)
+			require.NotEqual(t, proposerBalance, big.NewInt(0))
+
 			// Define our L1 transaction timeout duration.
 			txTimeoutDuration := 10 * time.Duration(cfg.DeployConfig.L1BlockTime) * time.Second
 
 			// Bind to the deposit contract
-			depositContract, err := bindings.NewOptimismPortal(predeploys.DevOptimismPortalAddr, l1Client)
+			depositContract, err := bindings.NewOptimismPortal(cfg.L1Deployments.OptimismPortalProxy, l1Client)
 			_ = depositContract
 			require.NoError(t, err)
+
+			l2OutputOracle, err := bindings.NewL2OutputOracleCaller(cfg.L1Deployments.L2OutputOracleProxy, l1Client)
+			require.NoError(t, err)
+
+			finalizationPeriod, err := l2OutputOracle.FINALIZATIONPERIODSECONDS(nil)
+			require.NoError(t, err)
+			require.Equal(t, cfg.DeployConfig.FinalizationPeriodSeconds, finalizationPeriod.Uint64())
 
 			// Create a struct used to track our transactors and their transactions sent.
 			type TestAccountState struct {
@@ -457,11 +464,10 @@ func TestMixedWithdrawalValidity(t *testing.T) {
 			}
 
 			// Create a test account state for our transactor.
-			transactorKey := cfg.Secrets.Alice
 			transactor := &TestAccountState{
 				Account: &TestAccount{
 					HDPath: e2eutils.DefaultMnemonicConfig.Alice,
-					Key:    transactorKey,
+					Key:    cfg.Secrets.Alice,
 					L1Opts: nil,
 					L2Opts: nil,
 				},
@@ -500,6 +506,9 @@ func TestMixedWithdrawalValidity(t *testing.T) {
 
 			// Determine the address our request will come from
 			fromAddr := crypto.PubkeyToAddress(transactor.Account.Key.PublicKey)
+			fromBalance, err := l2Verif.BalanceAt(context.Background(), fromAddr, nil)
+			require.NoError(t, err)
+			require.Greaterf(t, fromBalance.Uint64(), uint64(700_000_000_000), "insufficient balance for %s", fromAddr)
 
 			// Initiate Withdrawal
 			withdrawAmount := big.NewInt(500_000_000_000)
@@ -507,9 +516,18 @@ func TestMixedWithdrawalValidity(t *testing.T) {
 			tx, err := l2l1MessagePasser.InitiateWithdrawal(transactor.Account.L2Opts, fromAddr, big.NewInt(21000), nil)
 			require.Nil(t, err, "sending initiate withdraw tx")
 
+			t.Logf("Waiting for tx %s to be in sequencer", tx.Hash().Hex())
+			receiptSeq, err := waitForTransaction(tx.Hash(), l2Seq, txTimeoutDuration)
+			require.Nil(t, err, "withdrawal initiated on L2 sequencer")
+			require.Equal(t, receiptSeq.Status, types.ReceiptStatusSuccessful, "transaction failed")
+
+			verifierTip, err := l2Verif.BlockByNumber(context.Background(), nil)
+			require.Nil(t, err)
+
+			t.Logf("Waiting for tx %s to be in verifier. Verifier tip is %s:%d. Included in sequencer in block %s:%d", tx.Hash().Hex(), verifierTip.Hash().Hex(), verifierTip.NumberU64(), receiptSeq.BlockHash.Hex(), receiptSeq.BlockNumber)
 			// Wait for the transaction to appear in L2 verifier
 			receipt, err := waitForTransaction(tx.Hash(), l2Verif, txTimeoutDuration)
-			require.Nil(t, err, "withdrawal initiated on L2 sequencer")
+			require.Nilf(t, err, "withdrawal tx %s not found in verifier. included in block %s:%d", tx.Hash().Hex(), receiptSeq.BlockHash.Hex(), receiptSeq.BlockNumber)
 			require.Equal(t, receipt.Status, types.ReceiptStatusSuccessful, "transaction failed")
 
 			// Obtain the header for the block containing the transaction (used to calculate gas fees)
@@ -528,17 +546,15 @@ func TestMixedWithdrawalValidity(t *testing.T) {
 			transactor.ExpectedL2Nonce = transactor.ExpectedL2Nonce + 1
 
 			// Wait for the finalization period, then we can finalize this withdrawal.
-			ctx, cancel = context.WithTimeout(context.Background(), 25*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
-			blockNumber, err := withdrawals.WaitForFinalizationPeriod(ctx, l1Client, predeploys.DevOptimismPortalAddr, receipt.BlockNumber)
+			ctx, cancel = context.WithTimeout(context.Background(), 40*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
+			require.NotEqual(t, cfg.L1Deployments.L2OutputOracleProxy, common.Address{})
+			blockNumber, err := withdrawals.WaitForOutputRootPublished(ctx, l1Client, cfg.L1Deployments.L2OutputOracleProxy, receipt.BlockNumber)
 			cancel()
 			require.Nil(t, err)
 
 			ctx, cancel = context.WithTimeout(context.Background(), txTimeoutDuration)
 			header, err = l2Verif.HeaderByNumber(ctx, new(big.Int).SetUint64(blockNumber))
 			cancel()
-			require.Nil(t, err)
-
-			l2OutputOracle, err := bindings.NewL2OutputOracleCaller(predeploys.DevL2OutputOracleAddr, l1Client)
 			require.Nil(t, err)
 
 			rpcClient, err := rpc.Dial(sys.Nodes["verifier"].WSEndpoint())
@@ -658,9 +674,9 @@ func TestMixedWithdrawalValidity(t *testing.T) {
 				require.Equal(t, types.ReceiptStatusSuccessful, proveReceipt.Status)
 
 				// Wait for finalization and then create the Finalized Withdrawal Transaction
-				ctx, cancel = context.WithTimeout(context.Background(), 40*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
+				ctx, cancel = context.WithTimeout(context.Background(), 45*time.Duration(cfg.DeployConfig.L1BlockTime)*time.Second)
 				defer cancel()
-				_, err = withdrawals.WaitForFinalizationPeriod(ctx, l1Client, predeploys.DevOptimismPortalAddr, header.Number)
+				err = withdrawals.WaitForFinalizationPeriod(ctx, l1Client, cfg.L1Deployments.OptimismPortalProxy, header.Number)
 				require.Nil(t, err)
 
 				// Finalize withdrawal
